@@ -63,6 +63,9 @@ SMART_WALLET_MIN_HITS = 3      # Min early buys to be considered smart
 SMART_WALLET_MIN_SUCCESS_RATE = 0.6  # Min 60% for "smart" label
 FIRST_BUYERS_DEPTH = 100       # How many early buyers to profile
 
-# ── DB path ───────────────────────────────────────────────────────────
+# ── Dashboard auth ──────────────────────────────────────────────────────
+DASHBOARD_TOKEN = os.getenv("DASHBOARD_TOKEN", "")  # empty string = no auth
+
+# ── DB path ──────────────────────────────────────────────────────────────
 DB_DIR = os.path.join(os.path.dirname(__file__), "data")
 DB_PATH = os.path.join(DB_DIR, "bot.db")

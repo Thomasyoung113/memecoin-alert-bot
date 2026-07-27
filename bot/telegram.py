@@ -1,6 +1,7 @@
 """
 Telegram alert sender — formats and sends alerts to Telegram.
 """
+import html
 import logging
 
 import requests
@@ -64,7 +65,7 @@ def send_alert(token_address: str, symbol: str, mcap: float,
     target_2x = _fmt_num(mcap * 2)
 
     lines = [
-        f"🚀 <b>${symbol}</b>",
+        f"🚀 <b>${html.escape(symbol)}</b>",
         f"<code>{short_addr}</code>",
         f"",
         f"💰 MCap: {_fmt_num(mcap)}",
@@ -129,7 +130,7 @@ def send_resolved(symbol: str, mcap: float, target_mcap: float,
     target_str = f"${target_mcap:,.0f}" if target_mcap > 0 else "?"
     peak_str = f"${peak_mcap:,.0f}" if peak_mcap else "?"
     lines = [
-        f"{'✅' if hit_2x else '❌'} <b>${symbol} — Resolved</b>",
+        f"{'✅' if hit_2x else '❌'} <b>${html.escape(symbol)} — Resolved</b>",
         f"Entry MCap: {_fmt_num(mcap)}",
         f"Target (2x): {target_str}",
         f"Peak MCap: {peak_str}",
