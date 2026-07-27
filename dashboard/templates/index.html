@@ -1,0 +1,269 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Alert Bot Dashboard</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    background: #0d1117; color: #c9d1d9; padding: 24px;
+  }
+  h1 { font-size: 1.6rem; font-weight: 600; margin-bottom: 20px; color: #f0f6fc; }
+  h1 small { font-size: 0.8rem; font-weight: 400; color: #8b949e; margin-left: 12px; }
+
+  /* ── Stats cards ─────────────────────────────────── */
+  .stats {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+    gap: 16px; margin-bottom: 24px;
+  }
+  .card {
+    background: #161b22; border: 1px solid #30363d; border-radius: 8px;
+    padding: 16px 20px; transition: border-color .15s;
+  }
+  .card:hover { border-color: #58a6ff; }
+  .card .label  { font-size: 0.75rem; text-transform: uppercase; letter-spacing: .06em; color: #8b949e; }
+  .card .value  { font-size: 1.75rem; font-weight: 700; margin-top: 4px; }
+  .card .sub    { font-size: 0.8rem; color: #8b949e; margin-top: 2px; }
+  .value.green  { color: #3fb950; }
+  .value.yellow { color: #d29922; }
+  .value.blue   { color: #58a6ff; }
+  .value.red    { color: #f85149; }
+  .value.white  { color: #f0f6fc; }
+
+  /* ── Tables ──────────────────────────────────────── */
+  .section-title { font-size: 1.1rem; font-weight: 600; margin: 24px 0 10px; color: #f0f6fc; }
+  table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
+  th {
+    text-align: left; padding: 8px 10px; border-bottom: 2px solid #30363d;
+    color: #8b949e; font-weight: 600; text-transform: uppercase; letter-spacing: .04em;
+  }
+  td { padding: 8px 10px; border-bottom: 1px solid #21262d; vertical-align: middle; }
+  tr:hover td { background: #161b22; }
+  .chip {
+    display: inline-block; padding: 2px 8px; border-radius: 12px;
+    font-size: 0.75rem; font-weight: 600;
+  }
+  .chip.pending  { background: #1f2a3f; color: #58a6ff; }
+  .chip.success  { background: #0d2818; color: #3fb950; }
+  .chip.fail     { background: #2d1215; color: #f85149; }
+  .chip.resolved { background: #1c2128; color: #8b949e; }
+  .mono { font-family: "SF Mono", "Fira Code", monospace; font-size: 0.8rem; }
+  .addr { max-width: 120px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: inline-block; vertical-align: middle; }
+
+  /* ── Logs ────────────────────────────────────────── */
+  .log-box {
+    background: #0d1117; border: 1px solid #30363d; border-radius: 8px;
+    padding: 12px 16px; font-family: "SF Mono", "Fira Code", monospace;
+    font-size: 0.78rem; line-height: 1.5; max-height: 360px; overflow-y: auto;
+    white-space: pre-wrap; word-break: break-all;
+  }
+  .log-box .time  { color: #484f58; }
+  .log-box .info  { color: #58a6ff; }
+  .log-box .warn  { color: #d29922; }
+  .log-box .error { color: #f85149; }
+
+  /* ── Status bar ──────────────────────────────────── */
+  .status-bar {
+    margin-top: 16px; padding: 8px 0; font-size: 0.8rem; color: #8b949e;
+    display: flex; justify-content: space-between; align-items: center;
+  }
+  .status-bar .dot {
+    display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+    margin-right: 6px; vertical-align: middle;
+  }
+  .dot.green  { background: #3fb950; }
+  .dot.yellow { background: #d29922; }
+  .dot.red    { background: #f85149; }
+  .last-updated { color: #484f58; }
+</style>
+</head>
+<body>
+
+<h1>🚀 Alert Bot Dashboard <small id="last-updated-label">loading…</small></h1>
+
+<!-- ── Stats cards ────────────────────────────── -->
+<div class="stats">
+  <div class="card">
+    <div class="label">Total Alerts</div>
+    <div class="value white" id="stat-total">—</div>
+  </div>
+  <div class="card">
+    <div class="label">Pending</div>
+    <div class="value yellow" id="stat-pending">—</div>
+  </div>
+  <div class="card">
+    <div class="label">Resolved</div>
+    <div class="value blue" id="stat-resolved">—</div>
+  </div>
+  <div class="card">
+    <div class="label">Hit 2x</div>
+    <div class="value green" id="stat-success">—</div>
+  </div>
+  <div class="card">
+    <div class="label">Success Rate</div>
+    <div class="value" id="stat-rate">—%</div>
+  </div>
+</div>
+
+<!-- ── Recent alerts ──────────────────────────── -->
+<div class="section-title">📋 Recent Alerts</div>
+<div style="overflow-x:auto;">
+<table>
+  <thead>
+    <tr>
+      <th>#</th>
+      <th>Symbol</th>
+      <th>Token</th>
+      <th>MCap</th>
+      <th>Target (2x)</th>
+      <th>Peak MCap</th>
+      <th>Status</th>
+      <th>Alerted At</th>
+    </tr>
+  </thead>
+  <tbody id="alerts-tbody">
+    <tr><td colspan="8" style="color:#8b949e;text-align:center;">Loading…</td></tr>
+  </tbody>
+</table>
+</div>
+
+<!-- ── Recent logs ────────────────────────────── -->
+<div class="section-title">📄 Recent Logs</div>
+<div class="log-box" id="log-box">Loading…</div>
+
+<!-- ── Status bar ─────────────────────────────── -->
+<div class="status-bar">
+  <span><span class="dot green" id="status-dot"></span><span id="status-text">Connected</span></span>
+  <span class="last-updated" id="last-updated-time"></span>
+</div>
+
+<script>
+// ── Helpers ──────────────────────────────────────────────────────────
+function fmtNum(n) {
+  if (n == null) return '—';
+  if (n >= 1_000_000_000) return '$' + (n / 1_000_000_000).toFixed(2) + 'B';
+  if (n >= 1_000_000) return '$' + (n / 1_000_000).toFixed(2) + 'M';
+  if (n >= 1_000) return '$' + (n / 1_000).toFixed(1) + 'K';
+  return '$' + Number(n).toFixed(0);
+}
+
+function fmtTime(iso) {
+  if (!iso) return '—';
+  const d = new Date(iso);
+  return d.toLocaleTimeString();
+}
+
+function addrShort(addr) {
+  if (!addr || addr.length < 10) return addr || '—';
+  return addr.slice(0, 6) + '…' + addr.slice(-4);
+}
+
+function escapeHtml(s) {
+  if (s == null) return '';
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+// ── Fetch & render ───────────────────────────────────────────────────
+async function fetchStats() {
+  const r = await fetch('/api/stats');
+  return r.json();
+}
+async function fetchAlerts() {
+  const r = await fetch('/api/alerts');
+  return r.json();
+}
+async function fetchLogs() {
+  const r = await fetch('/api/logs');
+  return r.json();
+}
+
+function renderStats(data) {
+  document.getElementById('stat-total').textContent    = data.total_alerts ?? 0;
+  document.getElementById('stat-pending').textContent  = data.pending ?? 0;
+  document.getElementById('stat-resolved').textContent = data.resolved ?? 0;
+  document.getElementById('stat-success').textContent  = data.total_success ?? 0;
+  const rateEl = document.getElementById('stat-rate');
+  rateEl.textContent = (data.success_rate ?? 0) + '%';
+  rateEl.className = 'value ' + ((data.success_rate ?? 0) >= 50 ? 'green' : (data.success_rate ?? 0) > 0 ? 'yellow' : '');
+}
+
+function renderAlerts(alerts) {
+  const tbody = document.getElementById('alerts-tbody');
+  if (!alerts || alerts.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="8" style="color:#8b949e;text-align:center;">No alerts yet.</td></tr>';
+    return;
+  }
+  tbody.innerHTML = alerts.map(a => {
+    let statusClass, statusText;
+    if (a.resolved && a.hit_2x)      { statusClass = 'chip success';  statusText = '✅ Hit 2x'; }
+    else if (a.resolved && !a.hit_2x) { statusClass = 'chip fail';    statusText = '❌ Missed'; }
+    else                               { statusClass = 'chip pending'; statusText = '⏳ Pending'; }
+
+    const mcap = a.alert_mcap;
+    const target = a.target_2x_mcap;
+    const peak = a.peak_mcap;
+
+    return `<tr>
+      <td>${a.id}</td>
+      <td><strong>${escapeHtml(a.symbol)}</strong></td>
+      <td><span class="mono addr" title="${escapeHtml(a.token_address)}">${escapeHtml(addrShort(a.token_address))}</span></td>
+      <td class="mono">${fmtNum(mcap)}</td>
+      <td class="mono">${fmtNum(target)}</td>
+      <td class="mono">${fmtNum(peak)}</td>
+      <td><span class="${statusClass}">${statusText}</span></td>
+      <td>${fmtTime(a.alert_time)}</td>
+    </tr>`;
+  }).join('');
+}
+
+function renderLogs(data) {
+  const box = document.getElementById('log-box');
+  if (!data || !data.lines || data.lines.length === 0) {
+    box.textContent = '(no log entries)';
+    return;
+  }
+  // Colourise known log levels
+  const html = data.lines.map(line => {
+    const escaped = escapeHtml(line);
+    if (line.includes('[ERROR]')) return '<span class="error">' + escaped + '</span>';
+    if (line.includes('[WARNING]')) return '<span class="warn">' + escaped + '</span>';
+    return escaped;
+  }).join('\n');
+  box.innerHTML = html;
+  box.scrollTop = box.scrollHeight;
+}
+
+function updateStatus(ok, msg) {
+  const dot = document.getElementById('status-dot');
+  const text = document.getElementById('status-text');
+  dot.className = 'dot ' + (ok ? 'green' : 'red');
+  text.textContent = msg || (ok ? 'Connected' : 'Disconnected');
+}
+
+function updateTimestamp() {
+  document.getElementById('last-updated-time').textContent = new Date().toLocaleTimeString();
+  document.getElementById('last-updated-label').textContent = 'last updated ' + new Date().toLocaleTimeString();
+}
+
+async function refresh() {
+  try {
+    const [stats, alerts, logs] = await Promise.all([fetchStats(), fetchAlerts(), fetchLogs()]);
+    renderStats(stats);
+    renderAlerts(alerts);
+    renderLogs(logs);
+    updateStatus(true);
+  } catch (e) {
+    console.error('Refresh failed:', e);
+    updateStatus(false, 'Fetch error — ' + e.message);
+  }
+  updateTimestamp();
+}
+
+// ── Startup ──────────────────────────────────────────────────────────
+refresh();
+setInterval(refresh, 5000);
+</script>
+</body>
+</html>

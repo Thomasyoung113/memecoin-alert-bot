@@ -1,0 +1,186 @@
+"""
+Web dashboard for Alert Bot — lightweight HTTP server using only stdlib.
+Serves a live-updating HTML dashboard and JSON API endpoints backed by bot.models.
+"""
+import json
+import logging
+import os
+import threading
+import time
+from http.server import HTTPServer, SimpleHTTPRequestHandler
+from pathlib import Path
+
+from bot.models import get_conn
+
+logger = logging.getLogger("dashboard")
+
+HERE = Path(__file__).parent
+TEMPLATES = HERE / "templates"
+
+# How far back in the log file to read (bytes)
+LOG_TAIL_BYTES = 16 * 1024  # 16 KB
+LOG_PATH = HERE.parent / "bot.log"
+
+PORT = 8080
+
+
+class _DashboardHandler(SimpleHTTPRequestHandler):
+    """Request handler that serves the dashboard HTML + JSON API endpoints."""
+
+    # Silence default request logging (we keep our own)
+    def log_message(self, format, *args):
+        logger.debug("HTTP %s — %s", self.address_string(), format % args)
+
+    def _send_json(self, data, status=200):
+        body = json.dumps(data).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _send_html(self, html: str, status=200):
+        body = html.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _send_error_json(self, msg: str, status=500):
+        self._send_json({"error": msg}, status)
+
+    def _route_api_stats(self):
+        """Return total / success / pending counts."""
+        try:
+            conn = get_conn()
+            total_alerts = conn.execute(
+                "SELECT COUNT(*) FROM alerts"
+            ).fetchone()[0]
+            total_success = conn.execute(
+                "SELECT COUNT(*) FROM alerts WHERE resolved = 1 AND hit_2x = 1"
+            ).fetchone()[0]
+            pending = conn.execute(
+                "SELECT COUNT(*) FROM alerts WHERE resolved = 0"
+            ).fetchone()[0]
+            resolved = conn.execute(
+                "SELECT COUNT(*) FROM alerts WHERE resolved = 1"
+            ).fetchone()[0]
+            conn.close()
+            success_rate = (total_success / resolved * 100) if resolved > 0 else 0.0
+            self._send_json({
+                "total_alerts": total_alerts,
+                "total_success": total_success,
+                "resolved": resolved,
+                "pending": pending,
+                "success_rate": round(success_rate, 1),
+            })
+        except Exception as e:
+            logger.exception("Error fetching stats")
+            self._send_error_json(str(e))
+
+    def _route_api_alerts(self):
+        """Return recent alerts (latest 50), newest first."""
+        try:
+            conn = get_conn()
+            rows = conn.execute("""
+                SELECT id, token_address, symbol, alert_mcap, alert_price,
+                       target_2x_mcap, hit_2x, resolved, alert_time, peak_mcap
+                FROM alerts
+                ORDER BY id DESC
+                LIMIT 50
+            """).fetchall()
+            conn.close()
+            self._send_json([dict(r) for r in rows])
+        except Exception as e:
+            logger.exception("Error fetching alerts")
+            self._send_error_json(str(e))
+
+    def _route_api_logs(self):
+        """Return the last N lines of bot.log."""
+        try:
+            if not LOG_PATH.exists():
+                self._send_json({"lines": [], "truncated": False})
+                return
+            size = LOG_PATH.stat().st_size
+            read_size = min(LOG_TAIL_BYTES, size)
+            with open(LOG_PATH, "rb") as f:
+                if read_size < size:
+                    f.seek(-read_size, os.SEEK_END)
+                    # Skip the first (possibly partial) line
+                    f.readline()
+                raw = f.read().decode("utf-8", errors="replace")
+            lines = [line.rstrip("\n\r") for line in raw.splitlines()]
+            self._send_json({"lines": lines, "truncated": read_size < size})
+        except Exception as e:
+            logger.exception("Error reading log")
+            self._send_error_json(str(e))
+
+    def do_GET(self):
+        path = self.path.split("?")[0]  # strip query params
+        if path == "/":
+            self._serve_index()
+        elif path == "/api/stats":
+            self._route_api_stats()
+        elif path == "/api/alerts":
+            self._route_api_alerts()
+        elif path == "/api/logs":
+            self._route_api_logs()
+        else:
+            self._send_json({"error": "Not found"}, 404)
+
+    def _serve_index(self):
+        index_path = TEMPLATES / "index.html"
+        if not index_path.exists():
+            self._send_error_json("index.html not found", 500)
+            return
+        html = index_path.read_text(encoding="utf-8")
+        self._send_html(html)
+
+
+class DashboardServer:
+    """Thin wrapper around HTTPServer that runs in a daemon thread."""
+
+    def __init__(self, host: str = "0.0.0.0", port: int = PORT):
+        self.host = host
+        self.port = port
+        self._server = HTTPServer((host, port), _DashboardHandler)
+        self._thread: threading.Thread | None = None
+
+    def start(self):
+        """Start the server in a daemon thread."""
+        if self._thread and self._thread.is_alive():
+            logger.warning("Dashboard already running on %s:%d", self.host, self.port)
+            return
+
+        def _serve():
+            logger.info(
+                "Dashboard starting on http://%s:%d", self.host, self.port
+            )
+            self._server.serve_forever()
+
+        self._thread = threading.Thread(target=_serve, daemon=True, name="dashboard")
+        self._thread.start()
+        logger.info("Dashboard thread started")
+
+    def stop(self):
+        """Shutdown the HTTP server."""
+        self._server.shutdown()
+        if self._thread:
+            self._thread.join(timeout=3)
+        logger.info("Dashboard stopped")
+
+
+# Convenience singleton
+_default_server: DashboardServer | None = None
+
+
+def start_dashboard(host: str = "0.0.0.0", port: int = PORT):
+    """Start the dashboard server in a daemon thread (idempotent)."""
+    global _default_server
+    if _default_server is not None:
+        return _default_server
+    _default_server = DashboardServer(host, port)
+    _default_server.start()
+    return _default_server

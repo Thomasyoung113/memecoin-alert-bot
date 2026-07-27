@@ -1,0 +1,20 @@
+# Sensitive
+.env
+
+# Runtime
+bot.log
+bot.pid
+*.pid
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Database
+data/
+
+# Telegram offset
+data/tg_offset.txt
+
+# Bot profile pic (generated)
+bot_profile.png
