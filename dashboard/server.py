@@ -2,6 +2,7 @@
 Web dashboard for Alert Bot — lightweight HTTP server using only stdlib.
 Serves a live-updating HTML dashboard and JSON API endpoints backed by bot.models.
 """
+import hmac
 import json
 import logging
 import os
@@ -144,10 +145,10 @@ class _DashboardHandler(SimpleHTTPRequestHandler):
         parsed = urlparse(self.path)
         params = parse_qs(parsed.query)
         token = (params.get("token") or [None])[0]
-        if token == DASHBOARD_TOKEN:
+        if hmac.compare_digest(token or '', DASHBOARD_TOKEN):
             return True
         header_token = self.headers.get("X-Auth-Token")
-        if header_token == DASHBOARD_TOKEN:
+        if hmac.compare_digest(header_token or '', DASHBOARD_TOKEN):
             return True
         return False
 
