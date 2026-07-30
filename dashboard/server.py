@@ -174,6 +174,11 @@ class _DashboardHandler(SimpleHTTPRequestHandler):
             self._send_error_json("index.html not found", 500)
             return
         html = index_path.read_text(encoding="utf-8")
+        # Inject the dashboard token so the frontend JS can use it for API calls
+        if DASHBOARD_TOKEN:
+            # Insert a meta tag with the token right before the closing </head>
+            meta = f'<meta name="dashboard-token" content="{DASHBOARD_TOKEN}">\n'
+            html = html.replace("</head>", f"{meta}</head>")
         self._send_html(html)
 
 

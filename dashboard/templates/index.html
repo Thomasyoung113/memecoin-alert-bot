@@ -165,23 +165,31 @@ function escapeHtml(s) {
   return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }
 
+// ── Auth ─────────────────────────────────────────────────────────────
+const DASHBOARD_TOKEN = (document.querySelector('meta[name="dashboard-token"]') || {}).content || '';
+
+function apiFetch(path) {
+  const headers = {};
+  if (DASHBOARD_TOKEN) headers['X-Auth-Token'] = DASHBOARD_TOKEN;
+  return fetch(path, { headers }).then(r => {
+    if (!r.ok) throw new Error(path + ' returned ' + r.status);
+    return r.json();
+  });
+}
+
 // ── Fetch & render ───────────────────────────────────────────────────
 async function fetchStats() {
-  const r = await fetch('/api/stats');
-  if (!r.ok) throw new Error('Stats: ' + r.status);
-  return r.json();
+  const data = await apiFetch('/api/stats');
+  return data;
 }
 async function fetchAlerts() {
-  const r = await fetch('/api/alerts');
-  if (!r.ok) throw new Error('Alerts: ' + r.status);
-  const data = await r.json();
+  const data = await apiFetch('/api/alerts');
   if (!Array.isArray(data)) throw new Error('alerts is not an array');
   return data;
 }
 async function fetchLogs() {
-  const r = await fetch('/api/logs');
-  if (!r.ok) throw new Error('Logs: ' + r.status);
-  return r.json();
+  const data = await apiFetch('/api/logs');
+  return data;
 }
 
 function renderStats(data) {
