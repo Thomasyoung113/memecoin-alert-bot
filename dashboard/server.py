@@ -23,7 +23,7 @@ TEMPLATES = HERE / "templates"
 LOG_TAIL_BYTES = 16 * 1024  # 16 KB
 LOG_PATH = HERE.parent / "bot.log"
 
-PORT = 8080
+PORT = int(os.getenv("PORT", "8080"))
 
 # Allowed origins for CORS — only send Access-Control-Allow-Origin if Origin matches
 ALLOWED_ORIGINS = {
