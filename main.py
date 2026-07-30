@@ -146,9 +146,12 @@ def main():
                         r["symbol"], r["alert_mcap"],
                         r.get("target_mcap", r["alert_mcap"] * 2),
                         r["hit_2x"], r["peak_mcap"],
+                        hit_loss=r.get("hit_loss", False),
+                        current_mcap=r.get("current_mcap"),
                     )
                     # Phase 2: Update smart wallet stats based on resolution
-                    # (This will be wired once we have token_address in resolutions)
+                    if r["hit_2x"]:
+                        mark_token_success_for_wallets(r.get("token_address", ""))
                 if resolutions:
                     total_alerts, total_success, success_rate = get_stats()
                     logger.info("Track record after resolution: %d/%d — %.1f%%",
@@ -157,10 +160,13 @@ def main():
                 # ── 2b. Check insider selling on unresolved alerts ──
                 insider_alerts = check_insider_selling_for_alerts()
                 for ia in insider_alerts:
+                    mcap_str = (f"${ia['current_mcap']:,.0f}"
+                                if ia.get('current_mcap')
+                                else f"${ia['alert_mcap']:,.0f} (alert time)")
                     msg = (
                         f"⚠️ <b>Insider Selling — ${ia['symbol']}</b>\n"
                         f"{ia['details']}\n"
-                        f"MCap at alert: ${ia['alert_mcap']:,.0f}"
+                        f"Current MCap: {mcap_str}"
                     )
                     send_update(msg)
                 if insider_alerts:

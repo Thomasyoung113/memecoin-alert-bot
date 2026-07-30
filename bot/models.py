@@ -30,6 +30,7 @@ def init_db():
             alert_time      TIMESTAMP,
             target_2x_mcap  REAL,
             hit_2x          INTEGER DEFAULT 0,
+            hit_loss        INTEGER DEFAULT 0,
             hit_time        TIMESTAMP,
             peak_mcap       REAL,
             resolved        INTEGER DEFAULT 0,
@@ -99,6 +100,13 @@ def init_db():
         conn2.close()
     except sqlite3.OperationalError:
         pass  # column already exists
+    try:
+        conn2 = get_conn()
+        conn2.execute("ALTER TABLE alerts ADD COLUMN hit_loss INTEGER DEFAULT 0")
+        conn2.commit()
+        conn2.close()
+    except sqlite3.OperationalError:
+        pass  # column already exists
 
 
 # ── Alert helpers ─────────────────────────────────────────────────────
@@ -132,12 +140,19 @@ def get_pending_alerts():
     return [dict(r) for r in rows]
 
 
-def mark_resolved(token_address: str, hit_2x: bool, peak_mcap: float = None):
+def mark_resolved(token_address: str, hit_2x: bool, peak_mcap: float = None,
+                  hit_loss: bool = False):
     now = datetime.now(timezone.utc).isoformat()
     conn = get_conn()
     if hit_2x:
         conn.execute("""
             UPDATE alerts SET hit_2x = 1, hit_time = ?, peak_mcap = ?,
+                              resolved = 1
+            WHERE token_address = ? AND resolved = 0
+        """, (now, peak_mcap, token_address))
+    elif hit_loss:
+        conn.execute("""
+            UPDATE alerts SET hit_loss = 1, hit_time = ?, peak_mcap = ?,
                               resolved = 1
             WHERE token_address = ? AND resolved = 0
         """, (now, peak_mcap, token_address))
@@ -162,6 +177,16 @@ def get_stats():
     conn.close()
     rate = (success / total * 100) if total > 0 else 0.0
     return total, success, round(rate, 1)
+
+
+def get_loss_counts() -> int:
+    """Return the number of alerts that resolved as loss (-50%)."""
+    conn = get_conn()
+    count = conn.execute(
+        "SELECT COUNT(*) FROM alerts WHERE resolved = 1 AND hit_loss = 1"
+    ).fetchone()[0]
+    conn.close()
+    return count
 
 
 # ── Wallet helpers (Phase 2) ──────────────────────────────────────────

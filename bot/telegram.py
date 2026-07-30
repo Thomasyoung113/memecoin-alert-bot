@@ -125,29 +125,50 @@ def send_update(message: str):
 
 
 def send_resolved(symbol: str, mcap: float, target_mcap: float,
-                  hit_2x: bool, peak_mcap: float | None):
-    """Notify when an alerted token resolves (hit 2x or failed)."""
+                  hit_2x: bool, peak_mcap: float | None,
+                  hit_loss: bool = False, current_mcap: float | None = None):
+    """Notify when an alerted token resolves (hit 2x, hit -50% loss, or stale)."""
     target_str = f"${target_mcap:,.0f}" if target_mcap > 0 else "?"
     peak_str = f"${peak_mcap:,.0f}" if peak_mcap else "?"
-    lines = [
-        f"{'✅' if hit_2x else '❌'} <b>${html.escape(symbol)} — Resolved</b>",
-        f"Entry MCap: {_fmt_num(mcap)}",
-        f"Target (2x): {target_str}",
-        f"Peak MCap: {peak_str}",
-    ]
-    if hit_2x:
-        lines.append(f"")
-        lines.append(f"🎯 Hit 2x! Profit achieved.")
+    current_str = f"${current_mcap:,.0f}" if current_mcap else "?"
+
+    if hit_loss:
+        lines = [
+            f"💀 <b>${html.escape(symbol)} — Stopped Out (-50%)</b>",
+            f"Entry MCap: {_fmt_num(mcap)}",
+            f"Current MCap: {current_str}",
+            f"Peak MCap: {peak_str}",
+            f"",
+            f"Token lost 50%% of its value. Alert resolved as loss.",
+        ]
+    elif hit_2x:
+        lines = [
+            f"✅ <b>${html.escape(symbol)} — Resolved (Win)</b>",
+            f"Entry MCap: {_fmt_num(mcap)}",
+            f"Target (2x): {target_str}",
+            f"Peak MCap: {peak_str}",
+            f"",
+            f"🎯 Hit 2x! Profit achieved.",
+        ]
     else:
+        lines = [
+            f"❌ <b>${html.escape(symbol)} — Resolved (Missed)</b>",
+            f"Entry MCap: {_fmt_num(mcap)}",
+            f"Target (2x): {target_str}",
+            f"Peak MCap: {peak_str}",
+        ]
         fell_short = target_mcap - (peak_mcap or 0)
         lines.append(f"")
         lines.append(f"Missed 2x by ${fell_short:,.0f}" if fell_short > 0 else
                      f"Token did not reach target.")
 
-    from bot.models import get_stats
+    from bot.models import get_stats, get_loss_counts
     total_calls, successful_calls, success_rate = get_stats()
+    loss_count = get_loss_counts()
     lines.append(f"")
     lines.append(f"📊 Bot Track Record: {success_rate}% ({successful_calls}/{total_calls})")
+    if loss_count > 0:
+        lines.append(f"💀 Losses: {loss_count}")
 
     _send_message("\n".join(lines))
 

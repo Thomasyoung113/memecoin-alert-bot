@@ -220,10 +220,14 @@ def check_insider_selling_for_alerts() -> list[dict]:
 
         result = check_insider_selling(alert["token_address"], snapshot)
         if result["is_dumping"]:
+            # Fetch current MCap for the insider alert display
+            from bot.tracker import _fetch_current_mcap
+            current_mcap = _fetch_current_mcap(alert["token_address"])
             results.append({
                 "symbol": alert["symbol"],
                 "token_address": alert["token_address"],
                 "alert_mcap": alert["alert_mcap"],
+                "current_mcap": current_mcap or alert["alert_mcap"],
                 "details": result["details"],
             })
             logger.warning("Insider selling confirmed for $%s: %s",

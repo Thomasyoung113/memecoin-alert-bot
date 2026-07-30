@@ -1,11 +1,12 @@
 """
-Outcome tracker — monitors alerted tokens to see if they hit 2x.
+Outcome tracker — monitors alerted tokens to see if they hit 2x or -50%.
+Every 60s check evaluates each pending token for both outcomes.
 """
 import logging
 
 import requests
 
-from config import DEXSCREENER_BASE, OUTCOME_CHECK_INTERVAL
+from config import DEXSCREENER_BASE, LOSS_TARGET
 from bot.models import get_pending_alerts, mark_resolved
 
 logger = logging.getLogger(__name__)
@@ -29,10 +30,11 @@ def _fetch_current_mcap(token_address: str) -> float | None:
 
 def check_outcomes() -> list[dict]:
     """
-    Check all pending alerts to see if they hit 2x.
+    Check all pending alerts to see if they hit 2x (win) or -50% (loss).
 
     Returns a list of resolution dicts:
-      [{"symbol", "alert_mcap", "target_mcap", "hit_2x", "peak_mcap"}, ...]
+      [{"symbol", "alert_mcap", "target_mcap", "hit_2x", "hit_loss",
+        "peak_mcap", "current_mcap", "token_address"}, ...]
     """
     pending = get_pending_alerts()
     if not pending:
@@ -49,12 +51,14 @@ def check_outcomes() -> list[dict]:
 
         target_mcap = alert["target_2x_mcap"]
         alert_mcap = alert["alert_mcap"]
+        loss_mcap = alert_mcap * LOSS_TARGET
 
         # Update peak if needed
         peak = alert.get("peak_mcap") or alert_mcap
         new_peak = max(peak, current_mcap)
 
         hit_2x = current_mcap >= target_mcap or new_peak >= target_mcap
+        hit_loss = current_mcap <= loss_mcap
 
         if hit_2x:
             mark_resolved(addr, True, new_peak)
@@ -63,10 +67,27 @@ def check_outcomes() -> list[dict]:
                 "alert_mcap": alert_mcap,
                 "target_mcap": target_mcap,
                 "hit_2x": True,
+                "hit_loss": False,
                 "peak_mcap": new_peak,
+                "current_mcap": current_mcap,
+                "token_address": addr,
             })
-            logger.info("✅ %s hit 2x! (MCap: %.0f → %.0f)",
+            logger.info("✅ %s hit 2x! (MCap: %.0f -> %.0f)",
                         alert["symbol"], alert_mcap, new_peak)
+        elif hit_loss:
+            mark_resolved(addr, False, new_peak, hit_loss=True)
+            resolutions.append({
+                "symbol": alert["symbol"],
+                "alert_mcap": alert_mcap,
+                "target_mcap": target_mcap,
+                "hit_2x": False,
+                "hit_loss": True,
+                "peak_mcap": new_peak,
+                "current_mcap": current_mcap,
+                "token_address": addr,
+            })
+            logger.info("❌ %s hit -50%% loss! (MCap: %.0f -> %.0f)",
+                        alert["symbol"], alert_mcap, current_mcap)
         else:
             # Update peak even if not resolved
             if new_peak > peak:
@@ -77,7 +98,6 @@ def check_outcomes() -> list[dict]:
 
 def _update_peak(alert_id: int, peak_mcap: float):
     """Update the peak_mcap for an alert."""
-    import sqlite3
     from bot.models import get_conn
     conn = get_conn()
     conn.execute(
@@ -92,8 +112,9 @@ def force_resolve_stale():
     """
     Mark any pending alerts that have exceeded the max check window as
     resolved (failed). This prevents unbounded growth.
+
+    Returns number of stale alerts resolved.
     """
-    from config import OUTCOME_MAX_CHECKS
     from bot.models import get_conn
 
     conn = get_conn()
@@ -103,8 +124,6 @@ def force_resolve_stale():
     ).fetchall()
     resolved_count = 0
     for r in rows:
-        # Simple heuristic: if we've been checking for N+ cycles, resolve
-        # We track this implicitly via resolved=0 + peak_mcap
         peak = r["peak_mcap"] or r["alert_mcap"]
         mark_resolved(r["token_address"], False, peak)
         resolved_count += 1

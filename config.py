@@ -13,7 +13,7 @@ RUGCHECK_BASE = "https://api.rugcheck.xyz/v1"
 
 # ── Scan intervals (seconds) ──────────────────────────────────────────
 POLL_INTERVAL = 30            # How often to check DexScreener for new tokens
-OUTCOME_CHECK_INTERVAL = 300  # Every 5min check if alerted tokens hit 2x
+OUTCOME_CHECK_INTERVAL = 60   # Every 1min check if alerted tokens hit 2x or -50%
 LEARN_INTERVAL = 3600         # Every hour re-run learning analysis
 WIDE_SCAN_INTERVAL = 600      # Every 10min scan for $10M+ tokens (Phase 2)
 
@@ -32,6 +32,7 @@ LIQUIDITY_LOCKED_TARGET = 100  # Target % for LP lock
 
 # ── Outcome tracking ──────────────────────────────────────────────────
 TWO_X_TARGET = 2.0             # Multiply alert MCap by this for 2x
+LOSS_TARGET = 0.5              # Multiplier for -50% loss check (0.5 = half the alert MCap)
 OUTCOME_MAX_HOURS = 48         # Stop watching after this many hours
 OUTCOME_MAX_CHECKS = int(OUTCOME_MAX_HOURS * 3600 / OUTCOME_CHECK_INTERVAL)
 
