@@ -180,7 +180,7 @@ class _DashboardHandler(SimpleHTTPRequestHandler):
 class DashboardServer:
     """Thin wrapper around HTTPServer that runs in a daemon thread."""
 
-    def __init__(self, host: str = "127.0.0.1", port: int = PORT):
+    def __init__(self, host: str = "0.0.0.0", port: int = PORT):
         self.host = host
         self.port = port
         self._server = ThreadingHTTPServer((host, port), _DashboardHandler)
@@ -214,7 +214,7 @@ class DashboardServer:
 _default_server: DashboardServer | None = None
 
 
-def start_dashboard(host: str = "127.0.0.1", port: int = PORT):
+def start_dashboard(host: str = "0.0.0.0", port: int = PORT):
     """Start the dashboard server in a daemon thread (idempotent)."""
     global _default_server
     if _default_server is not None:
