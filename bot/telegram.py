@@ -6,32 +6,45 @@ import logging
 
 import requests
 
-from config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+from config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, TELEGRAM_CHANNEL_ID
 
 logger = logging.getLogger(__name__)
 
 
+def _get_target_chat_ids() -> list[str]:
+    """Return all chat IDs to send messages to."""
+    ids = []
+    if TELEGRAM_CHAT_ID:
+        ids.append(TELEGRAM_CHAT_ID)
+    if TELEGRAM_CHANNEL_ID:
+        ids.append(TELEGRAM_CHANNEL_ID)
+    return ids
+
+
 def _send_message(text: str, parse_mode: str = "HTML") -> bool:
-    """Send a plain message to Telegram. Returns True on success."""
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+    """Send a plain message to all target chats. Returns True if at least one succeeded."""
+    target_ids = _get_target_chat_ids()
+    if not TELEGRAM_BOT_TOKEN or not target_ids:
         logger.warning("Telegram not configured — set TELEGRAM_BOT_TOKEN "
                        "and TELEGRAM_CHAT_ID in .env")
         return False
 
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": text,
-        "parse_mode": parse_mode,
-        "disable_web_page_preview": False,
-    }
-    try:
-        resp = requests.post(url, json=payload, timeout=10)
-        resp.raise_for_status()
-        return True
-    except requests.RequestException as e:
-        logger.error("Failed to send Telegram message: %s", e)
-        return False
+    success = False
+    for chat_id in target_ids:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        payload = {
+            "chat_id": chat_id,
+            "text": text,
+            "parse_mode": parse_mode,
+            "disable_web_page_preview": False,
+        }
+        try:
+            resp = requests.post(url, json=payload, timeout=10)
+            resp.raise_for_status()
+            success = True
+        except requests.RequestException as e:
+            logger.error("Failed to send to %s: %s", chat_id, e)
+    return success
 
 
 def _fmt_num(n: float) -> str:

@@ -5,7 +5,8 @@ load_dotenv()
 
 # ── Telegram ──────────────────────────────────────────────────────────
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")       # your personal chat ID
+TELEGRAM_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID", "")  # channel ID (e.g. -1001234567890)
 
 # ── API base URLs ─────────────────────────────────────────────────────
 DEXSCREENER_BASE = "https://api.dexscreener.com"
