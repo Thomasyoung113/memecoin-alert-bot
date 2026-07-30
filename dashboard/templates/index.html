@@ -168,14 +168,19 @@ function escapeHtml(s) {
 // ── Fetch & render ───────────────────────────────────────────────────
 async function fetchStats() {
   const r = await fetch('/api/stats');
+  if (!r.ok) throw new Error('Stats: ' + r.status);
   return r.json();
 }
 async function fetchAlerts() {
   const r = await fetch('/api/alerts');
-  return r.json();
+  if (!r.ok) throw new Error('Alerts: ' + r.status);
+  const data = await r.json();
+  if (!Array.isArray(data)) throw new Error('alerts is not an array');
+  return data;
 }
 async function fetchLogs() {
   const r = await fetch('/api/logs');
+  if (!r.ok) throw new Error('Logs: ' + r.status);
   return r.json();
 }
 
@@ -256,7 +261,7 @@ async function refresh() {
     updateStatus(true);
   } catch (e) {
     console.error('Refresh failed:', e);
-    updateStatus(false, 'Fetch error — ' + e.message);
+    updateStatus(false, 'Fetch error — see console');
   }
   updateTimestamp();
 }
