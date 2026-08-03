@@ -10,6 +10,17 @@ from config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, TELEGRAM_CHANNEL_ID
 
 logger = logging.getLogger(__name__)
 
+# ── Safe logging helper (strip bot token from URLs) ───────────────────
+_TOKEN_PLACEHOLDER = "BOT_TOKEN_REDACTED"
+
+
+def _safe_log_error(action: str, chat_id: str, exception: Exception):
+    """Log a Telegram API error without exposing the bot token in the URL."""
+    msg = str(exception)
+    if TELEGRAM_BOT_TOKEN and TELEGRAM_BOT_TOKEN in msg:
+        msg = msg.replace(TELEGRAM_BOT_TOKEN, _TOKEN_PLACEHOLDER)
+    logger.error("Failed to %s for %s: %s", action, chat_id, msg)
+
 
 def _get_target_chat_ids() -> list[str]:
     """Return all chat IDs to send messages to."""
@@ -43,7 +54,7 @@ def _send_message(text: str, parse_mode: str = "HTML") -> bool:
             resp.raise_for_status()
             success = True
         except requests.RequestException as e:
-            logger.error("Failed to send to %s: %s", chat_id, e)
+            _safe_log_error("sendMessage", chat_id, e)
     return success
 
 
@@ -212,7 +223,7 @@ def send_photo(photo_bytes: bytes, caption: str = None):
             resp.raise_for_status()
             success = True
         except requests.RequestException as e:
-            logger.error("Failed to send photo to %s: %s", chat_id, e)
+            _safe_log_error("sendPhoto", chat_id, e)
     return success
 
 

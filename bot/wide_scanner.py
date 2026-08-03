@@ -9,7 +9,7 @@ import threading
 import requests
 
 from config import DEXSCREENER_BASE, WIDE_SCAN_INTERVAL, WIDE_SCAN_MCAP_THRESHOLD
-from bot.models import get_conn
+from bot.models import execute, commit, close_cursor
 
 logger = logging.getLogger(__name__)
 
@@ -18,11 +18,9 @@ _seen_tokens: set = set()
 
 
 def _load_seen():
-    conn = get_conn()
-    rows = conn.execute(
-        "SELECT DISTINCT token_address FROM wallet_buys"
-    ).fetchall()
-    conn.close()
+    c = execute("SELECT DISTINCT token_address FROM wallet_buys")
+    rows = c.fetchall()
+    close_cursor(c)
     for r in rows:
         _seen_tokens.add(r["token_address"])
 
@@ -94,24 +92,25 @@ def profile_token(token_address: str) -> list[str]:
         return []
 
     # Save to DB
-    conn = get_conn()
     for i, wallet in enumerate(buyers):
-        conn.execute(
-            "INSERT OR IGNORE INTO wallets (address, first_seen) VALUES (?, ?)",
+        c = execute(
+            "INSERT INTO wallets (address, first_seen) VALUES (%s, %s) ON CONFLICT DO NOTHING",
             (wallet, time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
         )
-        conn.execute("""
-            INSERT OR IGNORE INTO wallet_buys
+        close_cursor(c)
+        c = execute("""
+            INSERT INTO wallet_buys
                 (wallet_address, token_address, buy_position, detected_at)
-            VALUES (?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s) ON CONFLICT DO NOTHING
         """, (wallet, token_address, i + 1,
               time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())))
-        conn.execute("""
+        close_cursor(c)
+        c = execute("""
             UPDATE wallets SET total_early_buys = total_early_buys + 1
-            WHERE address = ?
+            WHERE address = %s
         """, (wallet,))
-    conn.commit()
-    conn.close()
+        close_cursor(c)
+    commit()
 
     logger.info("Saved %d early buyers for %s", len(buyers), token_address[:8])
     return buyers

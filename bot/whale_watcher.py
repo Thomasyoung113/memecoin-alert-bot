@@ -18,12 +18,10 @@ _seen_tokens: set = set()
 
 def _load_seen():
     """Load previously seen token addresses from DB to survive restarts."""
-    from bot.models import get_conn
-    conn = get_conn()
-    rows = conn.execute(
-        "SELECT DISTINCT token_address FROM whale_alerts"
-    ).fetchall()
-    conn.close()
+    from bot.models import execute, close_cursor
+    c = execute("SELECT DISTINCT token_address FROM whale_alerts")
+    rows = c.fetchall()
+    close_cursor(c)
     for r in rows:
         _seen_tokens.add(r["token_address"])
     logger.debug("Loaded %d previously seen whale tokens", len(_seen_tokens))
@@ -31,16 +29,16 @@ def _load_seen():
 
 def _save_alert(token_address: str, whale_address: str):
     """Persist a whale alert to the DB (deduplicated by token+whale)."""
-    from bot.models import get_conn
+    from bot.models import execute, commit, close_cursor
     now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    conn = get_conn()
-    conn.execute("""
-        INSERT OR IGNORE INTO whale_alerts
+    c = execute("""
+        INSERT INTO whale_alerts
             (token_address, whale_address, detected_at)
-        VALUES (?, ?, ?)
+        VALUES (%s, %s, %s)
+        ON CONFLICT DO NOTHING
     """, (token_address, whale_address, now))
-    conn.commit()
-    conn.close()
+    close_cursor(c)
+    commit()
 
 
 def _get_token_symbol(token_address: str) -> str:
@@ -164,19 +162,18 @@ def start_whale_watcher():
     Follows the same pattern as wide_scanner.start_wide_scanner().
     """
     # Ensure the whale_alerts table exists
-    from bot.models import get_conn
-    conn = get_conn()
-    conn.execute("""
+    from bot.models import execute, commit, close_cursor
+    c = execute("""
         CREATE TABLE IF NOT EXISTS whale_alerts (
-            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            id              SERIAL PRIMARY KEY,
             token_address   TEXT NOT NULL,
             whale_address   TEXT NOT NULL,
             detected_at     TIMESTAMP,
             UNIQUE(token_address, whale_address)
         )
     """)
-    conn.commit()
-    conn.close()
+    close_cursor(c)
+    commit()
 
     def _loop():
         logger.info("Whale watcher started (interval: %ds, wallets: %d)",

@@ -191,30 +191,42 @@ def _cmd_wallet(chat_id: int, text: str):
         _reply(chat_id, f"✅ Default wallet set to '<b>{html.escape(label)}</b>'.")
 
     elif sub == "export":
-        default = get_default_wallet(user["id"])
+        # Require confirmation: /wallet export confirm
+        if len(parts) < 3 or parts[2].strip().lower() != "confirm":
+            _reply(chat_id,
+                "⚠️ <b>Export Private Key</b>\n\n"
+                "This will expose your wallet's private key. "
+                "Anyone with this key can control your wallet.\n\n"
+                "To confirm, send:\n"
+                "<code>/wallet export confirm</code>"
+            )
+            return
+        default = get_default_wallet(user["id"], include_privkey=True)
         if not default:
             _reply(chat_id, "❌ No wallets to export.")
             return
         from bot.wallet import decrypt_private_key
         try:
             raw_key = decrypt_private_key(default["encrypted_private_key"])
-            # Encode as base58 (Solana private key format)
-            priv_b58 = base58.b58encode(raw_key[:32]).decode()
+            # Encode full 64-byte secret key as base58 (standard Solana format)
+            priv_b58 = base58.b58encode(raw_key).decode()
+            logger.info("Wallet export by user %s (wallet: %s)", chat_id, _short_pubkey(default["public_key"]))
             _reply(chat_id,
                 "⚠️ <b>PRIVATE KEY EXPORT</b>\n\n"
                 f"Wallet: <b>{html.escape(default['label'])}</b>\n"
                 f"Address: <code>{default['public_key']}</code>\n\n"
                 f"Private key (base58):\n"
-                f"<code>{priv_b58}</code>\n\n"
+                f"<code>{html.escape(priv_b58)}</code>\n\n"
                 "🔴 <b>Never share this with anyone.</b>\n"
                 "Delete this message after saving."
             )
         except Exception as e:
-            logger.exception("Export failed")
+            logger.info("Export failed for user %s: wallet %s", chat_id, _short_pubkey(default["public_key"]))
             _reply(chat_id, "❌ Failed to export private key.")
 
     else:
-        _reply(chat_id, "❌ Unknown subcommand. Try: /wallet, /wallet new &lt;label&gt;, /wallet list, /wallet default &lt;label&gt;, /wallet export")
+        _reply(chat_id,
+            "❌ Unknown subcommand. Try: /wallet, /wallet new &lt;label&gt;, /wallet list, /wallet default &lt;label&gt;, /wallet export confirm")
 
 
 def _cmd_balance(chat_id: int, text: str):
@@ -268,7 +280,7 @@ def _route(chat_id: int, text: str):
     else:
         _reply(chat_id,
             "❌ Unknown command.\n\n"
-            "Available: /start, /wallet, /wallet new &lt;label&gt;, /wallet list, /wallet default &lt;label&gt;, /wallet export, /balance"
+            "Available: /start, /wallet, /wallet new &lt;label&gt;, /wallet list, /wallet default &lt;label&gt;, /wallet export confirm, /balance"
         )
 
 

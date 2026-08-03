@@ -174,13 +174,19 @@ def init_db():
 
 
 def _migrate_add_column(table, column, col_type):
-    """Safely add a column if it doesn't exist."""
+    """Safely add a column if it doesn't exist. table/column must be valid identifiers."""
+    import re
+    if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', table):
+        raise ValueError(f"Invalid table name: {table}")
+    if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', column):
+        raise ValueError(f"Invalid column name: {column}")
+    if not re.match(r'^[a-zA-Z0-9_ ()]+$', col_type):
+        raise ValueError(f"Invalid column type: {col_type}")
     try:
         c = execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} {col_type}")
         close_cursor(c)
         commit()
     except Exception:
-        pass  # column already exists or PG version doesn't support IF NOT EXISTS
         try:
             conn = get_conn()
             cur = conn.cursor()
@@ -326,11 +332,12 @@ def get_all_filter_configs():
 def get_or_create_user(telegram_id, username=None):
     """Get existing user or create a new one. Returns user dict."""
     now = datetime.now(timezone.utc).isoformat()
-    c = execute("SELECT * FROM bot_users WHERE telegram_id = %s", (telegram_id,))
+    c = execute(
+        "SELECT id, telegram_id, username, first_seen, last_active, is_whitelisted "
+        "FROM bot_users WHERE telegram_id = %s", (telegram_id,))
     user = _dict_rows(c)
     close_cursor(c)
     if user:
-        # Update last_active + username
         uid = user[0]["id"]
         c2 = execute("UPDATE bot_users SET last_active = %s, username = COALESCE(%s, username) WHERE id = %s",
                      (now, username, uid))
@@ -350,7 +357,9 @@ def get_or_create_user(telegram_id, username=None):
 
 
 def get_user_by_telegram_id(telegram_id):
-    c = execute("SELECT * FROM bot_users WHERE telegram_id = %s", (telegram_id,))
+    c = execute(
+        "SELECT id, telegram_id, username, first_seen, last_active, is_whitelisted "
+        "FROM bot_users WHERE telegram_id = %s", (telegram_id,))
     rows = _dict_rows(c)
     close_cursor(c)
     return rows[0] if rows else None
@@ -359,7 +368,6 @@ def get_user_by_telegram_id(telegram_id):
 def create_user_wallet(user_id, label, public_key, encrypted_private_key):
     """Create a new wallet for a user. First wallet is auto-default."""
     now = datetime.now(timezone.utc).isoformat()
-    # Check if this is the first wallet → make it default
     existing = get_user_wallets(user_id)
     is_default = len(existing) == 0
     c = execute("""
@@ -373,24 +381,32 @@ def create_user_wallet(user_id, label, public_key, encrypted_private_key):
     return wallet[0] if wallet else None
 
 
+# Column list used for wallet read queries (omits encrypted_private_key for safety)
+_WALLET_READ_COLS = "id, user_id, label, public_key, is_default, created_at, last_used"
+# Full column list including encrypted_private_key (only for export-needed queries)
+_WALLET_FULL_COLS = "id, user_id, label, public_key, encrypted_private_key, is_default, created_at, last_used"
+
+
 def get_user_wallets(user_id):
-    c = execute("SELECT * FROM user_wallets WHERE user_id = %s ORDER BY created_at ASC", (user_id,))
+    c = execute(f"SELECT {_WALLET_READ_COLS} FROM user_wallets "
+                "WHERE user_id = %s ORDER BY created_at ASC", (user_id,))
     rows = _dict_rows(c)
     close_cursor(c)
     return rows
 
 
-def get_default_wallet(user_id):
-    c = execute("SELECT * FROM user_wallets WHERE user_id = %s AND is_default = TRUE", (user_id,))
+def get_default_wallet(user_id, include_privkey=False):
+    cols = _WALLET_FULL_COLS if include_privkey else _WALLET_READ_COLS
+    c = execute(f"SELECT {cols} FROM user_wallets "
+                "WHERE user_id = %s AND is_default = TRUE", (user_id,))
     rows = _dict_rows(c)
     close_cursor(c)
     if rows:
         return rows[0]
-    # Fallback: first wallet
     wallets = get_user_wallets(user_id)
     if wallets:
         set_default_wallet(user_id, wallets[0]["id"])
-        return wallets[0]
+        return get_default_wallet(user_id, include_privkey)
     return None
 
 
@@ -403,9 +419,10 @@ def set_default_wallet(user_id, wallet_id):
     commit()
 
 
-def get_wallet_by_label(user_id, label):
-    c = execute("SELECT * FROM user_wallets WHERE user_id = %s AND label = %s",
-                (user_id, label))
+def get_wallet_by_label(user_id, label, include_privkey=False):
+    cols = _WALLET_FULL_COLS if include_privkey else _WALLET_READ_COLS
+    c = execute(f"SELECT {cols} FROM user_wallets "
+                "WHERE user_id = %s AND label = %s", (user_id, label))
     rows = _dict_rows(c)
     close_cursor(c)
     return rows[0] if rows else None
