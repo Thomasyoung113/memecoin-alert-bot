@@ -186,6 +186,61 @@ def send_resolved(symbol: str, mcap: float, target_mcap: float,
     _send_message("\n".join(lines))
 
 
+def send_photo(photo_bytes: bytes, caption: str = None):
+    """Send a photo to all target chats. Returns True if at least one succeeded."""
+    target_ids = _get_target_chat_ids()
+    if not TELEGRAM_BOT_TOKEN or not target_ids:
+        return False
+    success = False
+    for chat_id in target_ids:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
+        try:
+            resp = requests.post(
+                url,
+                files={"photo": ("card.png", photo_bytes, "image/png")},
+                data={"chat_id": chat_id},
+                timeout=20,
+            )
+            if caption:
+                # Send caption as a separate reply
+                requests.post(
+                    f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                    json={"chat_id": chat_id, "text": caption, "parse_mode": "HTML",
+                           "disable_web_page_preview": False},
+                    timeout=10,
+                )
+            resp.raise_for_status()
+            success = True
+        except requests.RequestException as e:
+            logger.error("Failed to send photo to %s: %s", chat_id, e)
+    return success
+
+
+def send_pnl_card(symbol: str, pnl_pct: float, entry_mcap: float,
+                   current_mcap: float = None, peak_mcap: float = None,
+                   duration: str = None, wallet: str = None):
+    """Generate and send a GEMBOT-branded PnL card as a photo."""
+    is_win = pnl_pct >= 0
+    from bot.pnl_card import generate_pnl_card
+    img_bytes = generate_pnl_card(
+        token_symbol=symbol,
+        pnl_pct=pnl_pct,
+        entry_mcap=entry_mcap,
+        current_mcap=current_mcap,
+        peak_mcap=peak_mcap,
+        duration=duration,
+        wallet=wallet,
+        telegram_username="thomasgem",
+        is_win=is_win,
+    )
+    status = "✅ HIT 2x!" if is_win else "💀 STOPPED OUT"
+    caption = (
+        f"<b>{status}</b>\n"
+        f"${symbol} | GEMBOT"
+    )
+    send_photo(img_bytes, caption=caption)
+
+
 def send_learning_update(iteration: int, changes: list[dict], new_rate: float):
     """Send an update about what the bot learned."""
     lines = [

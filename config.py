@@ -14,7 +14,7 @@ RUGCHECK_BASE = "https://api.rugcheck.xyz/v1"
 
 # ── Scan intervals (seconds) ──────────────────────────────────────────
 POLL_INTERVAL = 30            # How often to check DexScreener for new tokens
-OUTCOME_CHECK_INTERVAL = 60   # Every 1min check if alerted tokens hit 2x or -50%
+OUTCOME_CHECK_INTERVAL = 20            # Every 20s check if alerted tokens hit 2x or -50%
 LEARN_INTERVAL = 3600         # Every hour re-run learning analysis
 WIDE_SCAN_INTERVAL = 600      # Every 10min scan for $10M+ tokens (Phase 2)
 
@@ -61,13 +61,11 @@ WHALE_WATCH_LIST = [
 
 # ── Smart Money (Phase 2) ─────────────────────────────────────────────
 WIDE_SCAN_MCAP_THRESHOLD = 10_000_000
-SMART_WALLET_MIN_HITS = 3      # Min early buys to be considered smart
-SMART_WALLET_MIN_SUCCESS_RATE = 0.6  # Min 60% for "smart" label
-FIRST_BUYERS_DEPTH = 100       # How many early buyers to profile
+SMART_WALLET_MIN_HITS = 5      # Min early buys to be considered smart
+SMART_WALLET_MIN_SUCCESS_RATE = 0.8            # Min 80% for "smart" label
+FIRST_BUYERS_DEPTH = 500       # How many early buyers to profile
 
 # ── Dashboard auth ──────────────────────────────────────────────────────
 DASHBOARD_TOKEN = os.getenv("DASHBOARD_TOKEN", "")  # empty string = no auth
 
-# ── DB path ──────────────────────────────────────────────────────────────
-DB_DIR = os.path.join(os.path.dirname(__file__), "data")
-DB_PATH = os.path.join(DB_DIR, "bot.db")
+DATABASE_URL = os.getenv("DATABASE_URL", "")

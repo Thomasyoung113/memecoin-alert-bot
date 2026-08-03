@@ -7,7 +7,7 @@ import logging
 import requests
 
 from config import DEXSCREENER_BASE, LOSS_TARGET
-from bot.models import get_pending_alerts, mark_resolved
+from bot.models import get_pending_alerts, mark_resolved, execute, commit
 
 logger = logging.getLogger(__name__)
 
@@ -98,14 +98,12 @@ def check_outcomes() -> list[dict]:
 
 def _update_peak(alert_id: int, peak_mcap: float):
     """Update the peak_mcap for an alert."""
-    from bot.models import get_conn
-    conn = get_conn()
-    conn.execute(
-        "UPDATE alerts SET peak_mcap = ? WHERE id = ?",
+    c = execute(
+        "UPDATE alerts SET peak_mcap = %s WHERE id = %s",
         (peak_mcap, alert_id)
     )
-    conn.commit()
-    conn.close()
+    c.close()
+    commit()
 
 
 def force_resolve_stale():
@@ -116,20 +114,22 @@ def force_resolve_stale():
     Returns number of stale alerts resolved.
     """
     from bot.models import get_conn
-
     conn = get_conn()
-    rows = conn.execute(
+    c = conn.cursor()
+    c.execute(
         "SELECT id, token_address, symbol, alert_mcap, peak_mcap "
         "FROM alerts WHERE resolved = 0"
-    ).fetchall()
+    )
+    rows = c.fetchall()
+    c.close()
+
     resolved_count = 0
     for r in rows:
-        peak = r["peak_mcap"] or r["alert_mcap"]
-        mark_resolved(r["token_address"], False, peak)
+        peak = r[4] or r[3]  # peak_mcap or alert_mcap
+        mark_resolved(r[1], False, peak)  # token_address
         resolved_count += 1
 
     if resolved_count:
         logger.info("Force-resolved %d stale alerts", resolved_count)
 
-    conn.close()
     return resolved_count

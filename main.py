@@ -19,6 +19,7 @@ from bot.scanner import scan
 from bot.checker import is_safe
 from bot.telegram import (
     send_alert, send_resolved, send_learning_update, send_update,
+    send_pnl_card, send_photo,
 )
 from bot.tracker import check_outcomes, force_resolve_stale
 from bot.insider_tracker import check_insider_selling_for_alerts
@@ -149,6 +150,24 @@ def main():
                         hit_loss=r.get("hit_loss", False),
                         current_mcap=r.get("current_mcap"),
                     )
+                    # Send PnL card for 2x wins
+                    if r["hit_2x"]:
+                        alert_mcap = r["alert_mcap"]
+                        current_mcap = r.get("current_mcap", alert_mcap * 2)
+                        peak_mcap = r.get("peak_mcap", current_mcap)
+                        pnl_pct = ((current_mcap / alert_mcap) - 1) * 100
+                        try:
+                            send_pnl_card(
+                                symbol=r["symbol"],
+                                pnl_pct=pnl_pct,
+                                entry_mcap=alert_mcap,
+                                current_mcap=current_mcap,
+                                peak_mcap=peak_mcap,
+                                wallet=None,
+                            )
+                        except Exception as e:
+                            logger.error("Failed to generate PnL card for %s: %s",
+                                         r["symbol"], e)
                     # Phase 2: Update smart wallet stats based on resolution
                     if r["hit_2x"]:
                         mark_token_success_for_wallets(r.get("token_address", ""))
