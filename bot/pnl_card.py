@@ -41,10 +41,11 @@ WHITE = (240, 242, 245)
 GEMBOT_BLUE = (1, 131, 189)  # From the logo accent
 
 # ── Fonts ─────────────────────────────────────────────────────────────
-FONT_DIR = "/system/fonts/"
-F_BOLD = FONT_DIR + "DroidSans-Bold.ttf"
-F_REG = FONT_DIR + "DroidSans.ttf"
-F_MONO = FONT_DIR + "DroidSansMono.ttf"
+import os
+_FONT_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "assets")
+F_BOLD = os.path.join(_FONT_DIR, "JetBrainsMono-Bold.ttf")
+F_REG = F_BOLD
+F_MONO = F_BOLD
 
 
 def _font(path, size):
