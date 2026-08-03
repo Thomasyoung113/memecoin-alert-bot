@@ -68,4 +68,7 @@ FIRST_BUYERS_DEPTH = 500       # How many early buyers to profile
 # ── Dashboard auth ──────────────────────────────────────────────────────
 DASHBOARD_TOKEN = os.getenv("DASHBOARD_TOKEN", "")  # empty string = no auth
 
+# ── Wallet encryption ──────────────────────────────────────────────────
+WALLET_ENCRYPTION_KEY = os.getenv("WALLET_ENCRYPTION_KEY", "")
+
 DATABASE_URL = os.getenv("DATABASE_URL", "")

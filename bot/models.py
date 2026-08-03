@@ -138,8 +138,57 @@ def init_db():
     """)
     close_cursor(c)
 
+    # ── Bot users (Phase 1 wallets) ─────────────────────────────
+    c = execute("""
+        CREATE TABLE IF NOT EXISTS bot_users (
+            id              SERIAL PRIMARY KEY,
+            telegram_id     BIGINT UNIQUE NOT NULL,
+            username        TEXT,
+            first_seen      TIMESTAMP,
+            last_active     TIMESTAMP,
+            is_whitelisted  BOOLEAN DEFAULT FALSE
+        )
+    """)
+    close_cursor(c)
+
+    c = execute("""
+        CREATE TABLE IF NOT EXISTS user_wallets (
+            id                    SERIAL PRIMARY KEY,
+            user_id               INTEGER NOT NULL REFERENCES bot_users(id) ON DELETE CASCADE,
+            label                 TEXT NOT NULL,
+            public_key            TEXT UNIQUE NOT NULL,
+            encrypted_private_key TEXT NOT NULL,
+            is_default            BOOLEAN DEFAULT FALSE,
+            created_at            TIMESTAMP,
+            last_used             TIMESTAMP,
+            UNIQUE(user_id, label)
+        )
+    """)
+    close_cursor(c)
+
     commit()
     logger.info("Database initialized (PostgreSQL)")
+    
+    # Migrate: add newer columns if missing
+    _migrate_add_column("alerts", "hit_loss", "INTEGER DEFAULT 0")
+
+
+def _migrate_add_column(table, column, col_type):
+    """Safely add a column if it doesn't exist."""
+    try:
+        c = execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} {col_type}")
+        close_cursor(c)
+        commit()
+    except Exception:
+        pass  # column already exists or PG version doesn't support IF NOT EXISTS
+        try:
+            conn = get_conn()
+            cur = conn.cursor()
+            cur.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}")
+            conn.commit()
+            cur.close()
+        except Exception:
+            pass
 
 
 # ── Alert helpers ─────────────────────────────────────────────────────
@@ -270,3 +319,93 @@ def get_all_filter_configs():
     rows = c.fetchall()
     close_cursor(c)
     return {r[0]: r[1] for r in rows}
+
+
+# ── Bot users & wallet helpers (Phase 1) ──────────────────────────────
+
+def get_or_create_user(telegram_id, username=None):
+    """Get existing user or create a new one. Returns user dict."""
+    now = datetime.now(timezone.utc).isoformat()
+    c = execute("SELECT * FROM bot_users WHERE telegram_id = %s", (telegram_id,))
+    user = _dict_rows(c)
+    close_cursor(c)
+    if user:
+        # Update last_active + username
+        uid = user[0]["id"]
+        c2 = execute("UPDATE bot_users SET last_active = %s, username = COALESCE(%s, username) WHERE id = %s",
+                     (now, username, uid))
+        close_cursor(c2)
+        commit()
+        user[0]["last_active"] = now
+        return user[0]
+    c3 = execute("""
+        INSERT INTO bot_users (telegram_id, username, first_seen, last_active)
+        VALUES (%s, %s, %s, %s)
+        RETURNING id, telegram_id, username, first_seen, last_active, is_whitelisted
+    """, (telegram_id, username, now, now))
+    new_user = _dict_rows(c3)
+    close_cursor(c3)
+    commit()
+    return new_user[0] if new_user else None
+
+
+def get_user_by_telegram_id(telegram_id):
+    c = execute("SELECT * FROM bot_users WHERE telegram_id = %s", (telegram_id,))
+    rows = _dict_rows(c)
+    close_cursor(c)
+    return rows[0] if rows else None
+
+
+def create_user_wallet(user_id, label, public_key, encrypted_private_key):
+    """Create a new wallet for a user. First wallet is auto-default."""
+    now = datetime.now(timezone.utc).isoformat()
+    # Check if this is the first wallet → make it default
+    existing = get_user_wallets(user_id)
+    is_default = len(existing) == 0
+    c = execute("""
+        INSERT INTO user_wallets (user_id, label, public_key, encrypted_private_key, is_default, created_at, last_used)
+        VALUES (%s, %s, %s, %s, %s, %s, %s)
+        RETURNING id, user_id, label, public_key, is_default, created_at
+    """, (user_id, label, public_key, encrypted_private_key, is_default, now, now))
+    wallet = _dict_rows(c)
+    close_cursor(c)
+    commit()
+    return wallet[0] if wallet else None
+
+
+def get_user_wallets(user_id):
+    c = execute("SELECT * FROM user_wallets WHERE user_id = %s ORDER BY created_at ASC", (user_id,))
+    rows = _dict_rows(c)
+    close_cursor(c)
+    return rows
+
+
+def get_default_wallet(user_id):
+    c = execute("SELECT * FROM user_wallets WHERE user_id = %s AND is_default = TRUE", (user_id,))
+    rows = _dict_rows(c)
+    close_cursor(c)
+    if rows:
+        return rows[0]
+    # Fallback: first wallet
+    wallets = get_user_wallets(user_id)
+    if wallets:
+        set_default_wallet(user_id, wallets[0]["id"])
+        return wallets[0]
+    return None
+
+
+def set_default_wallet(user_id, wallet_id):
+    c = execute("UPDATE user_wallets SET is_default = FALSE WHERE user_id = %s", (user_id,))
+    close_cursor(c)
+    c2 = execute("UPDATE user_wallets SET is_default = TRUE WHERE id = %s AND user_id = %s",
+                 (wallet_id, user_id))
+    close_cursor(c2)
+    commit()
+
+
+def get_wallet_by_label(user_id, label):
+    c = execute("SELECT * FROM user_wallets WHERE user_id = %s AND label = %s",
+                (user_id, label))
+    rows = _dict_rows(c)
+    close_cursor(c)
+    return rows[0] if rows else None
