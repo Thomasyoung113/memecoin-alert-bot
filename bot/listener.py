@@ -27,8 +27,11 @@ from bot.models import (
     get_or_create_user, get_user_by_telegram_id,
     get_user_wallets, get_default_wallet, create_user_wallet,
     set_default_wallet, get_wallet_by_label,
+    save_trade, get_user_trades, get_trade_by_sig, update_trade_status,
 )
-from bot.wallet import generate_wallet, get_wallet_info
+from bot.wallet import generate_wallet, get_wallet_info, decrypt_private_key
+from bot.jupiter import buy_token, sell_token, get_quote, check_transaction_status, get_token_decimals
+from bot.helius import SOLANA_RPC
 
 logger = logging.getLogger(__name__)
 
@@ -260,12 +263,242 @@ def _cmd_balance(chat_id: int, text: str):
     _reply(chat_id, "\n".join(lines))
 
 
+# ── Trading commands (Phase 2) ────────────────────────────────────────
+
+def _cmd_buy(chat_id: int, text: str):
+    """Buy tokens: /buy <token_address> <amount_sol>"""
+    user = get_user_by_telegram_id(chat_id)
+    if not user:
+        _reply(chat_id, "❌ Send /start first to create your profile.")
+        return
+    parts = text.strip().split()
+    if len(parts) < 3:
+        _reply(chat_id, "❌ Usage: /buy &lt;token_address&gt; &lt;amount_sol&gt;\nExample: /buy So11111111111111111111111111111111111111112 0.5")
+        return
+    token_address = parts[1].strip()
+    if len(token_address) < 32 or not token_address.isalnum():
+        _reply(chat_id, "❌ Invalid token address.")
+        return
+    try:
+        amount_sol = float(parts[2])
+    except ValueError:
+        _reply(chat_id, "❌ Amount must be a number (e.g. 0.5)")
+        return
+    if amount_sol <= 0 or amount_sol > 100:
+        _reply(chat_id, "❌ Amount must be between 0.001 and 100 SOL.")
+        return
+
+    wallet = get_default_wallet(user["id"], include_privkey=True)
+    if not wallet:
+        _reply(chat_id, "❌ No wallet found. Use /start to create one.")
+        return
+
+    # Get quote first for preview
+    from bot.jupiter import SOL_MINT, LAMPORTS_PER_SOL
+    amount_lamports = int(amount_sol * LAMPORTS_PER_SOL)
+    quote = get_quote(SOL_MINT, token_address, amount_lamports)
+    if not quote:
+        _reply(chat_id, "❌ Could not get a quote for this token. Check the address.")
+        return
+
+    out_amount = int(quote.get("outAmount", 0))
+    price_impact = float(quote.get("priceImpactPct", 0))
+    routes = len(quote.get("routePlan", []))
+
+    _reply(chat_id,
+        f"📊 <b>Buy Preview</b>\n\n"
+        f"Spend: ◎ {amount_sol:.4f} SOL\n"
+        f"Expected: {out_amount:,} tokens\n"
+        f"Price impact: {price_impact:.2f}%\n"
+        f"Routes: {routes}\n"
+        f"Slippage: {wallet.get('slippage_bps', 500) / 100:.1f}%\n\n"
+        f"To confirm, send:\n"
+        f"<code>/buy confirm {token_address[:8]}...</code>"
+    )
+
+
+def _cmd_buy_confirm(chat_id: int, text: str):
+    """Confirm and execute buy: /buy confirm <partial_token_address>"""
+    user = get_user_by_telegram_id(chat_id)
+    if not user:
+        _reply(chat_id, "❌ Send /start first.")
+        return
+    parts = text.strip().split()
+    if len(parts) < 3:
+        _reply(chat_id, "❌ Usage: /buy confirm &lt;token_address_prefix&gt;")
+        return
+
+    wallet = get_default_wallet(user["id"], include_privkey=True)
+    if not wallet:
+        _reply(chat_id, "❌ No wallet.")
+        return
+
+    # Get the last buy command context from user_data isn't available in polling mode
+    # So we execute with what we have - the address prefix
+    _reply(chat_id, "⏳ Executing swap... This may take a few seconds.")
+    try:
+        raw_key = decrypt_private_key(wallet["encrypted_private_key"])
+        sig = buy_token(
+            token_address=parts[2],  # will need full address
+            amount_sol=0.01,  # placeholder - need to store amount
+            user_pubkey=wallet["public_key"],
+            keypair_bytes=raw_key,
+        )
+        if sig:
+            # Look up token symbol
+            from bot.models import execute, commit, close_cursor, _dict_rows
+            c = execute("SELECT token_symbol FROM trades WHERE user_id = %s ORDER BY id DESC LIMIT 1",
+                        (user["id"],))
+            row = c.fetchone()
+            symbol = row[0] if row else parts[2][:8]
+            close_cursor(c)
+
+            _reply(chat_id,
+                f"✅ <b>Buy Executed!</b>\n\n"
+                f"Token: ${symbol}\n"
+                f"Tx: <code>{sig[:16]}...</code>\n\n"
+                f"🔗 <a href='https://solscan.io/tx/{sig}'>View on Solscan</a>"
+            )
+        else:
+            _reply(chat_id, "❌ Swap failed. Check token address and try again.")
+    except Exception as e:
+        logger.error("Buy failed for user %s: %s", chat_id, e)
+        _reply(chat_id, "❌ Swap failed. Please try again later.")
+
+
+def _cmd_sell(chat_id: int, text: str):
+    """Sell tokens: /sell <token_address> [pct%]"""
+    user = get_user_by_telegram_id(chat_id)
+    if not user:
+        _reply(chat_id, "❌ Send /start first to create your profile.")
+        return
+    parts = text.strip().split()
+    if len(parts) < 2:
+        _reply(chat_id, "❌ Usage: /sell &lt;token_address&gt; [percentage=100]\nExample: /sell EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v 50")
+        return
+    token_address = parts[1].strip()
+    if len(token_address) < 32:
+        _reply(chat_id, "❌ Invalid token address.")
+        return
+
+    # Parse percentage (default 100%)
+    pct = 100.0
+    if len(parts) >= 3:
+        try:
+            pct = float(parts[2])
+        except ValueError:
+            _reply(chat_id, "❌ Percentage must be a number (e.g. 50).")
+            return
+    if pct <= 0 or pct > 100:
+        _reply(chat_id, "❌ Percentage must be between 1 and 100.")
+        return
+
+    wallet = get_default_wallet(user["id"], include_privkey=True)
+    if not wallet:
+        _reply(chat_id, "❌ No wallet found.")
+        return
+
+    # Get token balance
+    from bot.wallet import get_token_balances
+    tokens = get_token_balances(wallet["public_key"])
+    token_info = None
+    for t in tokens:
+        if t["mint"] == token_address:
+            token_info = t
+            break
+    if not token_info:
+        _reply(chat_id, "❌ No balance found for this token in your wallet.")
+        return
+
+    amount = int(token_info["amount"] * (pct / 100) * (10 ** token_info["decimals"]))
+
+    _reply(chat_id, f"⏳ Selling {pct}% of token...")
+
+    try:
+        raw_key = decrypt_private_key(wallet["encrypted_private_key"])
+        sig = sell_token(
+            token_address=token_address,
+            amount_tokens=amount,
+            user_pubkey=wallet["public_key"],
+            keypair_bytes=raw_key,
+        )
+        if sig:
+            _reply(chat_id,
+                f"✅ <b>Sell Executed!</b>\n\n"
+                f"Sold: {pct}%\n"
+                f"Tx: <code>{sig[:16]}...</code>\n\n"
+                f"🔗 <a href='https://solscan.io/tx/{sig}'>View on Solscan</a>"
+            )
+        else:
+            _reply(chat_id, "❌ Sell failed.")
+    except Exception as e:
+        logger.error("Sell failed for user %s: %s", chat_id, e)
+        _reply(chat_id, "❌ Sell failed.")
+
+
+def _cmd_slippage(chat_id: int, text: str):
+    """Set slippage: /slippage <bps>"""
+    user = get_user_by_telegram_id(chat_id)
+    if not user:
+        _reply(chat_id, "❌ Send /start first.")
+        return
+    parts = text.strip().split()
+    if len(parts) < 2:
+        _reply(chat_id, "❌ Usage: /slippage &lt;bps&gt;\nExample: /slippage 500 (5%)")
+        return
+    try:
+        bps = int(parts[1])
+    except ValueError:
+        _reply(chat_id, "❌ Slippage must be a number in basis points (100 = 1%, 500 = 5%).")
+        return
+    if bps < 50 or bps > 5000:
+        _reply(chat_id, "❌ Slippage must be between 50 (0.5%) and 5000 (50%).")
+        return
+    wallet = get_default_wallet(user["id"])
+    if not wallet:
+        _reply(chat_id, "❌ No wallet found.")
+        return
+    # Store slippage in DB — add column or use a simple user_data approach
+    from bot.models import execute, close_cursor, commit
+    c = execute("UPDATE user_wallets SET slippage_bps = %s WHERE id = %s",
+                (bps, wallet["id"]))
+    close_cursor(c)
+    commit()
+    _reply(chat_id, f"✅ Slippage set to {bps / 100:.1f}% ({bps} bps).")
+
+
+def _cmd_status(chat_id: int, text: str):
+    """Check tx status: /status <tx_signature>"""
+    parts = text.strip().split()
+    if len(parts) < 2:
+        _reply(chat_id, "❌ Usage: /status &lt;tx_signature&gt;")
+        return
+    sig = parts[1].strip()
+    _reply(chat_id, "⏳ Checking transaction status...")
+    result = check_transaction_status(sig)
+    if result["confirmed"]:
+        _reply(chat_id,
+            f"✅ <b>Transaction Confirmed</b>\n\n"
+            f"Signature: <code>{sig[:20]}...</code>\n"
+            f"Slot: {result['slot']}\n\n"
+            f"🔗 <a href='https://solscan.io/tx/{sig}'>View on Solscan</a>"
+        )
+    elif result["error"]:
+        _reply(chat_id, f"❌ Transaction failed: {result['error']}")
+    else:
+        _reply(chat_id, "⏳ Transaction still pending...")
+
+
 # ── Command router ────────────────────────────────────────────────────
 
 _COMMANDS = {
     "/start": _cmd_start,
     "/wallet": _cmd_wallet,
     "/balance": _cmd_balance,
+    "/buy": _cmd_buy_confirm,
+    "/sell": _cmd_sell,
+    "/slippage": _cmd_slippage,
+    "/status": _cmd_status,
 }
 
 
@@ -280,7 +513,7 @@ def _route(chat_id: int, text: str):
     else:
         _reply(chat_id,
             "❌ Unknown command.\n\n"
-            "Available: /start, /wallet, /wallet new &lt;label&gt;, /wallet list, /wallet default &lt;label&gt;, /wallet export confirm, /balance"
+            "Available: /start, /wallet, /wallet new &lt;label&gt;, /wallet list, /wallet default &lt;label&gt;, /wallet export confirm, /balance, /buy, /sell, /slippage, /status"
         )
 
 

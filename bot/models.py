@@ -152,6 +152,25 @@ def init_db():
     close_cursor(c)
 
     c = execute("""
+        CREATE TABLE IF NOT EXISTS trades (
+            id              SERIAL PRIMARY KEY,
+            user_id         INTEGER NOT NULL REFERENCES bot_users(id) ON DELETE CASCADE,
+            wallet_id       INTEGER NOT NULL REFERENCES user_wallets(id) ON DELETE CASCADE,
+            type            TEXT NOT NULL,
+            token_address   TEXT NOT NULL,
+            token_symbol    TEXT,
+            amount_sol      REAL,
+            amount_token    REAL,
+            price_sol       REAL,
+            tx_signature    TEXT,
+            status          TEXT DEFAULT 'pending',
+            slippage_bps    INTEGER DEFAULT 500,
+            created_at      TIMESTAMP
+        )
+    """)
+    close_cursor(c)
+
+    c = execute("""
         CREATE TABLE IF NOT EXISTS user_wallets (
             id                    SERIAL PRIMARY KEY,
             user_id               INTEGER NOT NULL REFERENCES bot_users(id) ON DELETE CASCADE,
@@ -159,9 +178,30 @@ def init_db():
             public_key            TEXT UNIQUE NOT NULL,
             encrypted_private_key TEXT NOT NULL,
             is_default            BOOLEAN DEFAULT FALSE,
+            slippage_bps          INTEGER DEFAULT 500,
             created_at            TIMESTAMP,
             last_used             TIMESTAMP,
             UNIQUE(user_id, label)
+        )
+    """)
+    close_cursor(c)
+
+    c = execute("""
+        CREATE TABLE IF NOT EXISTS trades (
+            id              SERIAL PRIMARY KEY,
+            user_id         INT NOT NULL REFERENCES bot_users(id),
+            wallet_id       INT NOT NULL REFERENCES user_wallets(id),
+            type            TEXT NOT NULL,
+            token_address   TEXT NOT NULL,
+            token_symbol    TEXT,
+            amount_sol      REAL,
+            amount_token    REAL,
+            price_sol       REAL,
+            price_usd       REAL,
+            tx_signature    TEXT,
+            status          TEXT DEFAULT 'pending',
+            slippage_bps    INT DEFAULT 500,
+            created_at      TIMESTAMP
         )
     """)
     close_cursor(c)
@@ -171,6 +211,7 @@ def init_db():
     
     # Migrate: add newer columns if missing
     _migrate_add_column("alerts", "hit_loss", "INTEGER DEFAULT 0")
+    _migrate_add_column("user_wallets", "slippage_bps", "INTEGER DEFAULT 500")
 
 
 def _migrate_add_column(table, column, col_type):
@@ -382,9 +423,9 @@ def create_user_wallet(user_id, label, public_key, encrypted_private_key):
 
 
 # Column list used for wallet read queries (omits encrypted_private_key for safety)
-_WALLET_READ_COLS = "id, user_id, label, public_key, is_default, created_at, last_used"
+_WALLET_READ_COLS = "id, user_id, label, public_key, is_default, slippage_bps, created_at, last_used"
 # Full column list including encrypted_private_key (only for export-needed queries)
-_WALLET_FULL_COLS = "id, user_id, label, public_key, encrypted_private_key, is_default, created_at, last_used"
+_WALLET_FULL_COLS = "id, user_id, label, public_key, encrypted_private_key, is_default, slippage_bps, created_at, last_used"
 
 
 def get_user_wallets(user_id):
@@ -426,3 +467,63 @@ def get_wallet_by_label(user_id, label, include_privkey=False):
     rows = _dict_rows(c)
     close_cursor(c)
     return rows[0] if rows else None
+
+
+# ── Trade helpers ──────────────────────────────────────────────────────────
+
+_TRADE_COLS = ("id, user_id, wallet_id, type, token_address, token_symbol, "
+               "amount_sol, amount_token, price_sol, price_usd, "
+               "tx_signature, status, slippage_bps, created_at")
+
+
+def save_trade(user_id, wallet_id, trade_type, token_address, token_symbol=None,
+               amount_sol=None, amount_token=None, price_sol=None, price_usd=None,
+               tx_signature=None, slippage_bps=500):
+    """Insert a new trade record. Returns the new trade id."""
+    now = datetime.now(timezone.utc).isoformat()
+    c = execute("""
+        INSERT INTO trades (user_id, wallet_id, type, token_address, token_symbol,
+                            amount_sol, amount_token, price_sol, price_usd,
+                            tx_signature, slippage_bps, created_at)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        RETURNING id
+    """, (user_id, wallet_id, trade_type, token_address, token_symbol,
+          amount_sol, amount_token, price_sol, price_usd,
+          tx_signature, slippage_bps, now))
+    trade_id = _scalar(c)
+    close_cursor(c)
+    commit()
+    return trade_id
+
+
+def get_user_trades(user_id, limit=20):
+    """Get the most recent trades for a user."""
+    c = execute(f"SELECT {_TRADE_COLS} FROM trades "
+                "WHERE user_id = %s ORDER BY created_at DESC LIMIT %s",
+                (user_id, limit))
+    rows = _dict_rows(c)
+    close_cursor(c)
+    return rows
+
+
+def get_trade_by_sig(signature):
+    """Look up a trade by its on-chain transaction signature."""
+    c = execute(f"SELECT {_TRADE_COLS} FROM trades WHERE tx_signature = %s",
+                (signature,))
+    rows = _dict_rows(c)
+    close_cursor(c)
+    return rows[0] if rows else None
+
+
+def update_trade_status(trade_id, status, tx_sig=None):
+    """Update the status (and optionally tx_signature) of a trade."""
+    if tx_sig is not None:
+        c = execute("""
+            UPDATE trades SET status = %s, tx_signature = %s
+            WHERE id = %s
+        """, (status, tx_sig, trade_id))
+    else:
+        c = execute("UPDATE trades SET status = %s WHERE id = %s",
+                    (status, trade_id))
+    close_cursor(c)
+    commit()
