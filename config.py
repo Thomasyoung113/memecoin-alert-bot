@@ -14,7 +14,7 @@ RUGCHECK_BASE = "https://api.rugcheck.xyz/v1"
 
 # ── Scan intervals (seconds) ──────────────────────────────────────────
 POLL_INTERVAL = 30            # How often to check DexScreener for new tokens
-OUTCOME_CHECK_INTERVAL = 20            # Every 20s check if alerted tokens hit 2x or -50%
+OUTCOME_CHECK_INTERVAL = 10            # Every 10s check if alerted tokens hit 2x or -50%
 LEARN_INTERVAL = 3600         # Every hour re-run learning analysis
 WIDE_SCAN_INTERVAL = 600      # Every 10min scan for $10M+ tokens (Phase 2)
 
