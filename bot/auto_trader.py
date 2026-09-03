@@ -40,6 +40,7 @@ from bot.jupiter import (
     get_token_decimals, SOL_MINT, LAMPORTS_PER_SOL,
 )
 from bot.tracker import _fetch_current_mcap
+from bot.wash_detector import allow_auto_buy, WASH_SCORE_AUTOBUY_MAX
 
 logger = logging.getLogger(__name__)
 
@@ -94,9 +95,15 @@ def _pnl_pct(entry_mcap, current_mcap) -> float | None:
 # ── BUY side ──────────────────────────────────────────────────────────
 
 def maybe_auto_buy(token_address: str, symbol: str, mcap: float,
-                   price: float, snapshot: dict) -> list[dict]:
+                   price: float, snapshot: dict,
+                   wash_score: int = 0) -> list[dict]:
     """
     Instant-buy an alerted token for every enabled auto-trade config.
+
+    wash_score: the candidate's wash score from wash_detector. The
+    auto-trader is STRICTER than calls — it only buys coins with
+    wash_score < WASH_SCORE_AUTOBUY_MAX (20), since fake volume means
+    no real exit liquidity for the position.
 
     Returns a list of dicts:
       {"symbol", "amount_sol", "tx_sig", "user_id", "wallet_id", "position_id"}
@@ -104,6 +111,12 @@ def maybe_auto_buy(token_address: str, symbol: str, mcap: float,
     from bot.billing import is_pro
     configs = get_enabled_auto_traders()
     if not configs:
+        return []
+
+    # Money gate: never auto-buy farmed coins (stricter than call gate)
+    if not allow_auto_buy(wash_score):
+        logger.info("Auto-buy blocked (wash score %d >= %d): %s",
+                    wash_score, WASH_SCORE_AUTOBUY_MAX, symbol)
         return []
 
     results = []

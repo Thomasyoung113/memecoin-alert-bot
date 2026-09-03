@@ -1,5 +1,10 @@
 """
 RugCheck safety checker — verifies token safety before alerting.
+
+Uses the FULL report endpoint (not /summary) so the creator-authenticity
+fields (creator, creatorBalance, graphInsidersDetected, insiderNetworks,
+rugged, launchpad) are available to the wash detector — the summary
+endpoint drops them all.
 """
 import logging
 
@@ -12,19 +17,18 @@ logger = logging.getLogger(__name__)
 
 def check_token(token_address: str) -> dict | None:
     """
-    Run RugCheck on a token address.
+    Run RugCheck on a token address (full report).
 
-    Returns a dict with safety info, or None if the check failed.
+    Returns the report dict, or None if the check failed.
     """
-    url = f"{RUGCHECK_BASE}/tokens/{token_address}/report/summary"
+    url = f"{RUGCHECK_BASE}/tokens/{token_address}/report"
     try:
         resp = requests.get(url, timeout=15)
         if resp.status_code == 404:
             logger.debug("RugCheck: no report yet for %s", token_address[:8])
             return None
         resp.raise_for_status()
-        data = resp.json()
-        return data
+        return resp.json()
     except requests.RequestException as e:
         logger.warning("RugCheck request failed for %s: %s",
                        token_address[:8], e)
@@ -35,7 +39,9 @@ def is_safe(token_address: str) -> tuple[bool, dict]:
     """
     Check if a token passes the RugCheck safety checks.
 
-    Returns (is_safe, details_dict).
+    Returns (is_safe, details_dict). details carries the raw report under
+    "report" so the wash detector can score creator authenticity without
+    a second RugCheck call.
     """
     report = check_token(token_address)
     if report is None:
@@ -52,6 +58,7 @@ def is_safe(token_address: str) -> tuple[bool, dict]:
         "risks": [r.get("name", str(r)) if isinstance(r, dict) else str(r)
                   for r in risks],
         "risk_count": len(risks),
+        "report": report,
     }
 
     # Check LP lock

@@ -163,11 +163,23 @@ def build_alert_text(token_address: str, symbol: str, mcap: float,
 
 def send_alert(token_address: str, symbol: str, mcap: float,
                price: float, snapshot: dict, safety: dict | None = None,
-               smart_wallets: list[dict] | None = None):
+               smart_wallets: list[dict] | None = None,
+               wash_score: int = 0, wash_detail: dict | None = None):
     """Broadcast the alert to the owner (+channel) AND DM eligible users."""
     from bot.models import get_telegram_ids_by_tier
     text = build_alert_text(token_address, symbol, mcap, snapshot, safety,
                             smart_wallets)
+    if wash_detail is not None:
+        from bot.wash_detector import wash_line
+        lines = text.split("\n")
+        # insert the wash line right after the RugCheck block (before the
+        # track-record footer): find the chart link line
+        for i, line in enumerate(lines):
+            if line.startswith("🔗"):
+                lines.insert(i, wash_line(wash_score, wash_detail))
+                lines.insert(i + 1, "")
+                break
+        text = "\n".join(lines)
     _send_message(text)
     # Per-user fanout: trial + paid Pro get every call in real time.
     # (Free tier only gets the weekly top call — see billing jobs.)

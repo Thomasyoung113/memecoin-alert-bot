@@ -26,6 +26,10 @@ from bot.wide_scanner import start_wide_scanner
 from bot.whale_watcher import start_whale_watcher
 from bot.smart_money import get_smart_wallets_for_token, mark_token_success_for_wallets
 from bot.milestones import check_milestones
+from bot.wash_detector import (
+    compute_wash_score, reject_call, wash_line, WASH_SCORE_AUTOBUY_MAX,
+)
+from bot.scanner import _fetch_pair_data as _fetch_pair_for_wash
 from bot.auto_trader import maybe_auto_buy, maybe_auto_sell, check_all_positions
 from bot.billing import start_billing
 from bot.telegram import (
@@ -137,11 +141,24 @@ def main():
                 logger.info("Processing candidate: $%s (MCap: $%.0f)",
                             symbol, mcap)
 
-                # Safety check via RugCheck
+                # Safety check via RugCheck (full report: creator fields
+                # ride along for the wash detector — no extra API call)
                 safe, safety_detail = is_safe(token_address)
                 if not safe:
                     logger.info("  └─ Unsafe: %s",
                                 safety_detail.get("reason", "unknown"))
+                    continue
+
+                # ── Wash-trading gate (Pump.fun creator-revenue farms) ──
+                # Owner decision: wash_score >= 35 = NO CALL at all.
+                wash = compute_wash_score(
+                    _fetch_pair_for_wash(token_address),
+                    rugcheck_report=safety_detail.get("report"),
+                )
+                if reject_call(wash["wash_score"]):
+                    logger.info("  └─ 🧼 Wash-gated %s (score %d: %s)",
+                                symbol, wash["wash_score"],
+                                wash_line(wash["wash_score"], wash["detail"]))
                     continue
 
                 # Phase 2: Check if any known smart wallets bought early on this token
@@ -150,16 +167,22 @@ def main():
                 # Save to DB
                 target_mcap = mcap * TWO_X_TARGET
                 save_alert(token_address, symbol, mcap, price,
-                           target_mcap, snapshot)
+                           target_mcap, snapshot,
+                           wash_score=wash["wash_score"],
+                           creator_address=wash["detail"].get("creator"))
 
                 # Send Telegram alert
                 send_alert(
                     token_address, symbol, mcap, price,
                     snapshot, safety_detail, smart_wallets,
+                    wash_score=wash["wash_score"],
+                    wash_detail=wash["detail"],
                 )
 
                 try:
-                    auto_trades = maybe_auto_buy(token_address, symbol, mcap, price, snapshot)
+                    auto_trades = maybe_auto_buy(
+                        token_address, symbol, mcap, price, snapshot,
+                        wash_score=wash["wash_score"])
                     for at in auto_trades:
                         send_update(f"🤖 Auto-bought ${symbol}\n"
                                     f"Amount: ◎ {at['amount_sol']:.4f}\n"

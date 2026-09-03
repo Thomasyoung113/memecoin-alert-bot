@@ -312,6 +312,8 @@ def init_db():
     # Migrate: add newer columns if missing
     _migrate_add_column("alerts", "hit_loss", "INTEGER DEFAULT 0")
     _migrate_add_column("alerts", "last_milestone", "REAL DEFAULT 0")
+    _migrate_add_column("alerts", "wash_score", "INTEGER DEFAULT 0")
+    _migrate_add_column("alerts", "creator_address", "TEXT")
     _migrate_add_column("user_wallets", "slippage_bps", "INTEGER DEFAULT 500")
     _migrate_add_column("trades", "price_usd", "REAL")
 
@@ -342,14 +344,16 @@ def _migrate_add_column(table, column, col_type):
 
 # ── Alert helpers ─────────────────────────────────────────────────────
 
-def save_alert(token_address, symbol, alert_mcap, alert_price, target_mcap, snapshot):
+def save_alert(token_address, symbol, alert_mcap, alert_price, target_mcap, snapshot,
+               wash_score=0, creator_address=None):
     now = datetime.now(timezone.utc).isoformat()
     c = execute("""
         INSERT INTO alerts (token_address, symbol, alert_mcap, alert_price, alert_time,
-                            target_2x_mcap, scan_snapshot)
-        VALUES (%s, %s, %s, %s, %s, %s, %s)
+                            target_2x_mcap, scan_snapshot, wash_score, creator_address)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
         ON CONFLICT (token_address) DO NOTHING
-    """, (token_address, symbol, alert_mcap, alert_price, now, target_mcap, json.dumps(snapshot)))
+    """, (token_address, symbol, alert_mcap, alert_price, now, target_mcap,
+          json.dumps(snapshot), wash_score, creator_address))
     close_cursor(c)
     commit()
     c2 = execute("SELECT id FROM alerts WHERE token_address = %s", (token_address,))

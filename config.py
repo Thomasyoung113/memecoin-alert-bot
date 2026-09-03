@@ -94,6 +94,17 @@ FREE_TOP_CALL_DAYS = 7           # free tier: 1 top call per week
 SIGNAL_HOUR_UTC = 13             # daily free-tier message hour
 PROMO_GEN_HOUR_UTC = 9           # daily promo batch hour (owner DM)
 
+# ── Wash-trading gate (Pump.fun creator-revenue farms) ────────────────
+# Fixed for the first month; then feed outcomes to the learner.
+WASH_SCORE_MAX = 35              # >= this = no call at all
+WASH_SCORE_AUTOBUY_MAX = 20      # auto-trader requires cleaner coins than calls
+WASH_FUNDER_CONCENTRATION_PCT = 40
+WASH_ROUNDTRIP_RATIO = 0.5
+WASH_SYMMETRY_BAND = (0.9, 1.15) # buys/sells ratio of a churn loop
+WASH_FLAT_PRICE_H1 = 3.0         # % — below = "flat" for symmetry signal
+WASH_SERIAL_FLIPPER_TOKENS = 10  # distinct tokens traded = farm wallet
+WASH_CLUSTER_MIN_JOURNEYS = 2    # buyer-clusters traveling together
+
 TREASURY_WALLET_ADDRESS = os.getenv("TREASURY_WALLET_ADDRESS", "")
 INVOICE_TTL_MINUTES = 60         # SOL deposit invoice lifetime
 PAYMENT_CONFIRMATIONS = 1        # confirmations before Pro activates
