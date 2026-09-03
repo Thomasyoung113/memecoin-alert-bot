@@ -559,6 +559,26 @@ def _cmd_status(chat_id: int, text: str):
 
 # ── Auto-trading commands (Phase 3) ───────────────────────────────────
 
+def _auto_menu_markup(cfg: dict | None) -> dict:
+    """Inline menu for /auto: amount presets + TP/SL presets + power."""
+    amount = float((cfg or {}).get("buy_amount_sol") or 0.1)
+    enabled = bool((cfg or {}).get("is_enabled"))
+    amt_row = []
+    for preset in (0.05, 0.1, 0.25, 0.5, 1.0):
+        label = f"◎{preset:g}" + (" ✅" if abs(amount - preset) < 1e-9 else "")
+        amt_row.append({"text": label, "callback_data": f"auto:amt_{preset:g}"})
+    return {"inline_keyboard": [
+        amt_row,
+        [{"text": f"TP +100%", "callback_data": "auto:tp_100"},
+         {"text": "TP +200%", "callback_data": "auto:tp_200"},
+         {"text": "SL -50%", "callback_data": "auto:sl_50"},
+         {"text": "SL -40%", "callback_data": "auto:sl_40"}],
+        [{"text": "🤖 Arm ON" if not enabled else "⭕ Turn OFF",
+          "callback_data": "auto:toggle"},
+         {"text": "🔄 Refresh", "callback_data": "auto:menu"}],
+    ]}
+
+
 def _cmd_auto(chat_id: int, text: str):
     """Auto-trading: /auto — show status, /auto on|off, /auto set <key> <value>."""
     user = get_user_by_telegram_id(chat_id)
@@ -606,7 +626,8 @@ def _cmd_auto(chat_id: int, text: str):
         lines.append("<code>/auto set tp 200</code> — take profit %")
         lines.append("<code>/auto set sl 40</code> — stop loss %")
         lines.append("<code>/auto set cooldown 30</code> — minutes")
-        _reply(chat_id, "\n".join(lines))
+        _reply(chat_id, "\n".join(lines),
+               reply_markup=_auto_menu_markup(cfg))
         return
 
     sub = parts[1].lower()
@@ -869,6 +890,72 @@ def _handle_callback(cb: dict):
     if data == "auto:menu":
         ack()
         _cmd_auto(chat_id, "/auto")
+        return
+
+    if data.startswith("auto:amt_"):
+        amount = float(data.rsplit("_", 1)[1])
+        uid = get_user_id(chat_id)
+        if not uid:
+            ack("Send /start first.", alert=True)
+            return
+        from bot.models import get_default_wallet, upsert_auto_trade_config
+        wallet = get_default_wallet(uid)
+        if not wallet:
+            ack("No wallet — send /start.", alert=True)
+            return
+        cfg = upsert_auto_trade_config(uid, wallet["id"],
+                                       {"buy_amount_sol": amount})
+        ack(f"Buy amount set to ◎ {amount:g}")
+        _reply(chat_id,
+               f"✅ <b>Auto-buy amount: ◎ {amount:g} per call</b>\n"
+               f"TP +{cfg['take_profit_pct']:.0f}% / SL -{cfg['stop_loss_pct']:.0f}%\n"
+               "🧼 Wash gate still applies: auto-buy only fires on clean calls.",
+               reply_markup=_auto_menu_markup(cfg))
+        return
+
+    if data.startswith("auto:tp_"):
+        pct = float(data.rsplit("_", 1)[1])
+        uid = get_user_id(chat_id)
+        wallet = get_default_wallet(uid) if uid else None
+        if not wallet:
+            ack("Send /start first.", alert=True)
+            return
+        cfg = upsert_auto_trade_config(uid, wallet["id"],
+                                       {"take_profit_pct": pct})
+        ack(f"Take profit set to +{pct:g}%")
+        _reply(chat_id, f"✅ <b>Take profit: +{pct:g}%</b>",
+               reply_markup=_auto_menu_markup(cfg))
+        return
+
+    if data.startswith("auto:sl_"):
+        pct = float(data.rsplit("_", 1)[1])
+        uid = get_user_id(chat_id)
+        wallet = get_default_wallet(uid) if uid else None
+        if not wallet:
+            ack("Send /start first.", alert=True)
+            return
+        cfg = upsert_auto_trade_config(uid, wallet["id"],
+                                       {"stop_loss_pct": pct})
+        ack(f"Stop loss set to -{pct:g}%")
+        _reply(chat_id, f"✅ <b>Stop loss: -{pct:g}%</b>",
+               reply_markup=_auto_menu_markup(cfg))
+        return
+
+    if data == "auto:toggle":
+        uid = get_user_id(chat_id)
+        wallet = get_default_wallet(uid) if uid else None
+        if not wallet:
+            ack("Send /start first.", alert=True)
+            return
+        from bot.models import get_auto_trade_config
+        cfg = get_auto_trade_config(uid, wallet["id"])
+        currently_on = bool(cfg and cfg["is_enabled"])
+        if currently_on:
+            _cmd_auto(chat_id, "/auto off")
+            ack("Auto-trading OFF")
+        else:
+            _cmd_auto(chat_id, "/auto on")
+            ack("Auto-trading ON")
         return
 
     if data == "pos:list":
