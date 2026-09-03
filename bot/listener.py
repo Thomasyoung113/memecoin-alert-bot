@@ -99,6 +99,47 @@ def _fmt_sol(lamports_or_sol: float, is_lamports: bool = False) -> str:
     return f"◎ {sol:.9f}"
 
 
+# ── Navigation: constant back button on every menu ────────────────────
+
+BACK_HOME = {"text": "⬅️ Back", "callback_data": "nav:home"}
+
+def _with_back(keyboard: list[list[dict]], target: str = "home") -> dict:
+    """Append a ⬅️ Back row to any inline keyboard. target: home|auto|sub."""
+    kb = [row for row in keyboard if row]  # don't mutate the caller's list
+    label = {"home": "⬅️ Main Menu", "auto": "⬅️ Auto-Trading",
+             "sub": "⬅️ Subscription"}[target]
+    cb = {"home": "nav:home", "auto": "auto:menu", "sub": "sub:menu"}[target]
+    kb.append([{"text": label, "callback_data": cb}])
+    return {"inline_keyboard": kb}
+
+
+def _main_menu_markup() -> dict:
+    """The hub screen everything returns to."""
+    return {"inline_keyboard": [
+        [{"text": "🤖 Auto-Trading", "callback_data": "auto:menu"},
+         {"text": "📊 Positions", "callback_data": "pos:list"}],
+        [{"text": "💎 Subscription", "callback_data": "sub:menu"},
+         {"text": "🎟 Promo Code", "callback_data": "promo:ask"}],
+        [{"text": "💼 Wallet", "callback_data": "nav:wallet"},
+         {"text": "⚖️ Balance", "callback_data": "nav:balance"}],
+    ]}
+
+
+def _main_menu(chat_id: int):
+    from bot.billing import subscription_status_line
+    from bot.models import get_user_by_telegram_id, ensure_subscription
+    user = get_user_by_telegram_id(chat_id)
+    if user:
+        ensure_subscription(user["id"])
+        status = subscription_status_line(user["id"])
+    else:
+        status = "Not registered yet — tap ⬅️ then send /start"
+    _reply(chat_id,
+           f"🤖 <b>GEMBOT — Main Menu</b>\n{status}\n\n"
+           "Pick an action below. Text commands always work too.",
+           reply_markup=_main_menu_markup())
+
+
 # ── Command handlers ──────────────────────────────────────────────────
 
 def _cmd_start(chat_id: int, text: str):
@@ -136,10 +177,10 @@ def _cmd_start(chat_id: int, text: str):
             f"💎 After the trial: <b>0.2 SOL/week · 0.5 SOL/month</b>\n"
             "Free tier keeps 1 top call/week + your wallet.\n"
             "🎟 Promo codes drop daily on @thomas_young",
-            reply_markup={"inline_keyboard": [
+            reply_markup=_with_back([
                 [{"text": "🤖 Arm Auto-Trading", "callback_data": "auto:menu"}],
                 [{"text": "💎 Go Pro", "callback_data": "sub:menu"}],
-            ]})
+            ]))
     else:
         default = get_default_wallet(user["id"])
         addr = _short_pubkey(default["public_key"]) if default else "?"
@@ -150,10 +191,10 @@ def _cmd_start(chat_id: int, text: str):
             f"Default wallet: {addr}\n"
             f"{subscription_status_line(user['id'])}\n\n"
             "Use /positions, /auto or /balance.",
-            reply_markup={"inline_keyboard": [
+            reply_markup=_with_back([
                 [{"text": "📊 Positions", "callback_data": "pos:list"},
                  {"text": "💎 Go Pro", "callback_data": "sub:menu"}],
-            ]})
+            ]))
 
 
 def _cmd_wallet(chat_id: int, text: str):
@@ -560,14 +601,14 @@ def _cmd_status(chat_id: int, text: str):
 # ── Auto-trading commands (Phase 3) ───────────────────────────────────
 
 def _auto_menu_markup(cfg: dict | None) -> dict:
-    """Inline menu for /auto: amount presets + TP/SL presets + power."""
+    """Inline menu for /auto: amount presets + TP/SL presets + power + Back."""
     amount = float((cfg or {}).get("buy_amount_sol") or 0.1)
     enabled = bool((cfg or {}).get("is_enabled"))
     amt_row = []
     for preset in (0.05, 0.1, 0.25, 0.5, 1.0):
         label = f"◎{preset:g}" + (" ✅" if abs(amount - preset) < 1e-9 else "")
         amt_row.append({"text": label, "callback_data": f"auto:amt_{preset:g}"})
-    return {"inline_keyboard": [
+    return _with_back([
         amt_row,
         [{"text": f"TP +100%", "callback_data": "auto:tp_100"},
          {"text": "TP +200%", "callback_data": "auto:tp_200"},
@@ -576,7 +617,7 @@ def _auto_menu_markup(cfg: dict | None) -> dict:
         [{"text": "🤖 Arm ON" if not enabled else "⭕ Turn OFF",
           "callback_data": "auto:toggle"},
          {"text": "🔄 Refresh", "callback_data": "auto:menu"}],
-    ]}
+    ])
 
 
 def _cmd_auto(chat_id: int, text: str):
@@ -708,12 +749,12 @@ def _require_pro(chat_id: int) -> bool:
         "💎 <b>0.2 SOL/week · 0.5 SOL/month</b>\n"
         "✅ Every call, real time · 🤖 24/7 auto-trading\n"
         "🎟 Promo codes drop daily on @thomas_young",
-        reply_markup={"inline_keyboard": [
+        reply_markup=_with_back([
             [{"text": "💎 Pay 0.2 SOL — Week", "callback_data": "sub:sol_week"},
              {"text": "💎 Pay 0.5 SOL — Month", "callback_data": "sub:sol_month"}],
             [{"text": "⭐ Pay with Stars", "callback_data": "sub:stars_menu"}],
             [{"text": "🎟 I have a promo code", "callback_data": "promo:ask"}],
-        ]})
+        ]))
     return False
 
 
@@ -729,12 +770,12 @@ def _subscribe_screen(chat_id: int):
         "🐋 Whale + insider alerts\n"
         "🏅 Milestone cards on every run\n\n"
         "<b>0.2 SOL / week &nbsp;·&nbsp; 0.5 SOL / month</b>",
-        reply_markup={"inline_keyboard": [
+        reply_markup=_with_back([
             [{"text": "💎 Week — 0.2 SOL", "callback_data": "sub:sol_week"},
              {"text": "💎 Month — 0.5 SOL", "callback_data": "sub:sol_month"}],
             [{"text": "⭐ Pay with Telegram Stars", "callback_data": "sub:stars_menu"}],
             [{"text": "🎟 Promo code", "callback_data": "promo:ask"}],
-        ]})
+        ]))
 
 
 def _cmd_subscribe(chat_id: int, text: str):
@@ -750,8 +791,9 @@ def _cmd_promo(chat_id: int, text: str):
             "Usage: <code>/promo GEM-XXXXXXXXXX</code>\n"
             "Codes drop daily on @thomas_young — first come, first served.\n"
             "⚠️ 3 attempts per day.",
-            reply_markup={"inline_keyboard": [
-                [{"text": "🎟 Enter code", "callback_data": "promo:ask"}]]})
+            reply_markup=_with_back([
+                [{"text": "🎟 Enter code", "callback_data": "promo:ask"}]],
+                target="sub"))
         return
     if not billing.promo_allowed(chat_id):
         _reply(chat_id, "🛑 Too many attempts today (3 max). Try again tomorrow.")
@@ -759,8 +801,8 @@ def _cmd_promo(chat_id: int, text: str):
     ok, msg = billing.redeem(parts[1], chat_id)
     if ok:
         _reply(chat_id, f"🎉 <b>{msg}</b>\n\n/auto on to arm the bot.",
-               reply_markup={"inline_keyboard": [
-                   [{"text": "🤖 Arm Auto-Trading", "callback_data": "auto:menu"}]]})
+               reply_markup=_with_back([
+                   [{"text": "🤖 Arm Auto-Trading", "callback_data": "auto:menu"}]]))
     else:
         _reply(chat_id, f"❌ {html.escape(msg)}")
 
@@ -787,7 +829,10 @@ def _positions_screen(chat_id: int):
     if not positions:
         _reply(chat_id,
                "📭 <b>No open positions.</b>\n\n"
-               "Arm /auto to catch the next call, or /buy manually.")
+               "Arm /auto to catch the next call, or /buy manually.",
+               reply_markup=_with_back([
+                   [{"text": "🤖 Auto-Trading", "callback_data": "auto:menu"}],
+               ]))
         return
     lines = ["📊 <b>Open positions</b>\n"]
     buttons = []
@@ -803,7 +848,8 @@ def _positions_screen(chat_id: int):
             {"text": f"Sell 50% ${sym}", "callback_data": f"sell:{p['token_address']}:50"},
             {"text": f"Sell 100%", "callback_data": f"sell:{p['token_address']}:100"},
         ])
-    _reply(chat_id, "\n".join(lines), reply_markup={"inline_keyboard": buttons})
+    _reply(chat_id, "\n".join(lines),
+           reply_markup=_with_back(buttons, target="home"))
 
 
 def _cmd_positions(chat_id: int, text: str):
@@ -829,6 +875,22 @@ def _handle_callback(cb: dict):
             billing._tg("answerCallbackQuery", payload)
 
     if chat_id is None:
+        return
+
+    # ── Navigation: back buttons ─────────────────────────────────────
+    if data == "nav:home":
+        ack()
+        _main_menu(chat_id)
+        return
+
+    if data == "nav:wallet":
+        ack()
+        _cmd_wallet(chat_id, "/wallet")
+        return
+
+    if data == "nav:balance":
+        ack()
+        _cmd_balance(chat_id, "/balance")
         return
 
     if data == "gate:check":
@@ -857,8 +919,9 @@ def _handle_callback(cb: dict):
                 f"Send <b>◎ {inv['amount']}</b> to:\n<code>{inv['address']}</code>\n\n"
                 f"⏱ Expires in {inv['ttl_minutes']} min.\n"
                 "Pro activates automatically after 1 confirmation.",
-                reply_markup={"inline_keyboard": [[
-                    {"text": "🔄 Check status", "callback_data": f"sub:check_{inv['invoice_id']}_{plan}"}]]})
+                reply_markup=_with_back([
+                    [{"text": "🔄 Check status", "callback_data": f"sub:check_{inv['invoice_id']}_{plan}"}],
+                ], target="sub"))
         else:
             _reply(chat_id, "❌ Could not create invoice. Try again shortly.")
         return
@@ -866,11 +929,12 @@ def _handle_callback(cb: dict):
     if data == "sub:stars_menu":
         ack()
         _reply(chat_id, "⭐ <b>Pay with Telegram Stars</b>",
-               reply_markup={"inline_keyboard": [
+               reply_markup=_with_back([
                    [{"text": f"⭐ Week — {billing.STARS_PLANS['week']['stars']} stars",
                      "callback_data": "sub:stars_week"}],
                    [{"text": f"⭐ Month — {billing.STARS_PLANS['month']['stars']} stars",
-                     "callback_data": "sub:stars_month"}]]})
+                     "callback_data": "sub:stars_month"}],
+               ], target="sub"))
         return
 
     if data.startswith("sub:stars_"):
