@@ -18,3 +18,6 @@ data/tg_offset.txt
 
 # Bot profile pic (generated)
 bot_profile.png
+# Card test output
+test_output/
+validate.py

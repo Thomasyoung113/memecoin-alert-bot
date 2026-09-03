@@ -5,7 +5,7 @@ and determines which wallets are "smart money".
 import logging
 
 from config import SMART_WALLET_MIN_HITS, SMART_WALLET_MIN_SUCCESS_RATE
-from bot.models import get_conn
+from bot.models import execute, close_cursor, commit, _dict_rows
 
 logger = logging.getLogger(__name__)
 
@@ -17,16 +17,13 @@ def score_wallet(wallet_address: str) -> dict:
     Returns dict with stats:
       {address, total_early_buys, successful_buys, total_calls, hit_rate, is_smart}
     """
-    conn = get_conn()
-
-    # Total early buys
-    row = conn.execute(
+    c = execute(
         "SELECT total_early_buys, successful_buys, total_calls "
-        "FROM wallets WHERE address = ?", (wallet_address,)
-    ).fetchone()
+        "FROM wallets WHERE address = %s", (wallet_address,))
+    rows = _dict_rows(c)
+    close_cursor(c)
 
-    if not row:
-        conn.close()
+    if not rows:
         return {
             "address": wallet_address,
             "total_early_buys": 0,
@@ -36,11 +33,9 @@ def score_wallet(wallet_address: str) -> dict:
             "is_smart": False,
         }
 
-    total = row["total_early_buys"]
-    successful = row["successful_buys"]
-    calls = row["total_calls"]
-
-    conn.close()
+    total = rows[0]["total_early_buys"]
+    successful = rows[0]["successful_buys"]
+    calls = rows[0]["total_calls"]
 
     hit_rate = (successful / total * 100) if total > 0 else 0.0
     is_smart = (total >= SMART_WALLET_MIN_HITS
@@ -60,15 +55,13 @@ def update_wallet_success(wallet_address: str, token_hit_2x: bool):
     """
     Update a wallet's success stats when a token they bought early resolves.
     """
-    conn = get_conn()
-    conn.execute(
+    c = execute(
         "UPDATE wallets SET total_calls = total_calls + 1, "
-        "successful_buys = successful_buys + ? "
-        "WHERE address = ?",
-        (1 if token_hit_2x else 0, wallet_address)
-    )
-    conn.commit()
-    conn.close()
+        "successful_buys = successful_buys + %s "
+        "WHERE address = %s",
+        (1 if token_hit_2x else 0, wallet_address))
+    close_cursor(c)
+    commit()
 
 
 def get_smart_wallets_for_token(token_address: str) -> list[dict]:
@@ -77,16 +70,16 @@ def get_smart_wallets_for_token(token_address: str) -> list[dict]:
 
     Returns list of wallet dicts sorted by hit rate descending.
     """
-    conn = get_conn()
-    rows = conn.execute("""
+    c = execute("""
         SELECT w.address, w.total_early_buys, w.successful_buys,
                w.total_calls, wb.buy_position
         FROM wallet_buys wb
         JOIN wallets w ON w.address = wb.wallet_address
-        WHERE wb.token_address = ? AND w.is_smart = 1
+        WHERE wb.token_address = %s AND w.is_smart = 1
         ORDER BY wb.buy_position ASC
-    """, (token_address,)).fetchall()
-    conn.close()
+    """, (token_address,))
+    rows = _dict_rows(c)
+    close_cursor(c)
 
     results = []
     for r in rows:
@@ -108,10 +101,10 @@ def refresh_smart_flags():
     Re-evaluate all wallets and update their is_smart flag.
     Run periodically as the DB grows.
     """
-    conn = get_conn()
-    wallets = conn.execute(
-        "SELECT address, total_early_buys, successful_buys FROM wallets"
-    ).fetchall()
+    c = execute(
+        "SELECT address, total_early_buys, successful_buys FROM wallets")
+    wallets = _dict_rows(c)
+    close_cursor(c)
 
     updated = 0
     for w in wallets:
@@ -121,33 +114,31 @@ def refresh_smart_flags():
         is_smart = (total >= SMART_WALLET_MIN_HITS
                     and hit_rate >= SMART_WALLET_MIN_SUCCESS_RATE)
 
-        conn.execute(
-            "UPDATE wallets SET is_smart = ? WHERE address = ?",
-            (1 if is_smart else 0, w["address"])
-        )
+        c = execute(
+            "UPDATE wallets SET is_smart = %s WHERE address = %s",
+            (1 if is_smart else 0, w["address"]))
+        close_cursor(c)
         if is_smart:
             updated += 1
 
-    conn.commit()
-    conn.close()
+    commit()
     logger.info("Smart flags refreshed: %d smart wallets", updated)
     return updated
 
 
-def mark_token_success_for_wallets(token_address: str, hit_2x: bool):
+def mark_token_success_for_wallets(token_address: str, hit_2x: bool = True):
     """
     When an alerted token resolves, update all wallets that bought it early.
     """
-    conn = get_conn()
-    wallets = conn.execute(
-        "SELECT wallet_address FROM wallet_buys WHERE token_address = ?",
-        (token_address,)
-    ).fetchall()
-    conn.close()
+    c = execute(
+        "SELECT wallet_address FROM wallet_buys WHERE token_address = %s",
+        (token_address,))
+    rows = _dict_rows(c)
+    close_cursor(c)
 
-    for w in wallets:
-        update_wallet_success(w["wallet_address"], hit_2x)
+    for row in rows:
+        update_wallet_success(row["wallet_address"], hit_2x)
 
     refresh_smart_flags()
     logger.info("Updated %d wallets for token %s (hit_2x=%s)",
-                len(wallets), token_address[:8], hit_2x)
+                len(rows), token_address[:8], hit_2x)

@@ -229,7 +229,9 @@ def send_photo(photo_bytes: bytes, caption: str = None):
 
 def send_pnl_card(symbol: str, pnl_pct: float, entry_mcap: float,
                    current_mcap: float = None, peak_mcap: float = None,
-                   duration: str = None, wallet: str = None):
+                   duration: str = None, wallet: str = None,
+                   caption_title: str = None, multiplier: float = None,
+                   sol_spent: float = None, sol_received: float = None):
     """Generate and send a GEMBOT-branded PnL card as a photo."""
     is_win = pnl_pct >= 0
     from bot.pnl_card import generate_pnl_card
@@ -243,11 +245,37 @@ def send_pnl_card(symbol: str, pnl_pct: float, entry_mcap: float,
         wallet=wallet,
         telegram_username="thomasgem",
         is_win=is_win,
+        multiplier=multiplier,
+        sol_spent=sol_spent,
+        sol_received=sol_received,
     )
-    status = "✅ HIT 2x!" if is_win else "💀 STOPPED OUT"
+    status = caption_title or ("✅ HIT 2x!" if is_win else "💀 STOPPED OUT")
     caption = (
         f"<b>{status}</b>\n"
         f"${symbol} | GEMBOT"
+    )
+    send_photo(img_bytes, caption=caption)
+
+
+def send_milestone_card(symbol: str, multiplier: float, alert_mcap: float,
+                        current_mcap: float = None, duration: str = None):
+    """Send a celebration card when a bot call crosses a new multiple (1.5x, 2x, 3x...)."""
+    from bot.pnl_card import generate_pnl_card
+    pnl_pct = (multiplier - 1) * 100
+    img_bytes = generate_pnl_card(
+        token_symbol=symbol,
+        pnl_pct=pnl_pct,
+        entry_mcap=alert_mcap,
+        current_mcap=current_mcap,
+        peak_mcap=current_mcap,
+        duration=duration,
+        telegram_username="thomasgem",
+        is_win=True,
+        multiplier=multiplier,
+        milestone_mode=True,
+    )
+    caption = (
+        f"🚀 <b>${html.escape(symbol)} just hit {multiplier:g}x</b> from a GEMBOT call!"
     )
     send_photo(img_bytes, caption=caption)
 

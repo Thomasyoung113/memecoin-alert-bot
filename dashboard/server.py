@@ -11,7 +11,7 @@ import time
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from bot.models import get_conn
+from bot.models import execute, close_cursor, _scalar, _dict_rows
 from config import DASHBOARD_TOKEN
 
 logger = logging.getLogger("dashboard")
@@ -73,20 +73,18 @@ class _DashboardHandler(SimpleHTTPRequestHandler):
     def _route_api_stats(self):
         """Return total / success / pending counts."""
         try:
-            conn = get_conn()
-            total_alerts = conn.execute(
-                "SELECT COUNT(*) FROM alerts"
-            ).fetchone()[0]
-            total_success = conn.execute(
-                "SELECT COUNT(*) FROM alerts WHERE resolved = 1 AND hit_2x = 1"
-            ).fetchone()[0]
-            pending = conn.execute(
-                "SELECT COUNT(*) FROM alerts WHERE resolved = 0"
-            ).fetchone()[0]
-            resolved = conn.execute(
-                "SELECT COUNT(*) FROM alerts WHERE resolved = 1"
-            ).fetchone()[0]
-            conn.close()
+            c = execute("SELECT COUNT(*) FROM alerts")
+            total_alerts = _scalar(c) or 0
+            close_cursor(c)
+            c = execute("SELECT COUNT(*) FROM alerts WHERE resolved = 1 AND hit_2x = 1")
+            total_success = _scalar(c) or 0
+            close_cursor(c)
+            c = execute("SELECT COUNT(*) FROM alerts WHERE resolved = 0")
+            pending = _scalar(c) or 0
+            close_cursor(c)
+            c = execute("SELECT COUNT(*) FROM alerts WHERE resolved = 1")
+            resolved = _scalar(c) or 0
+            close_cursor(c)
             success_rate = (total_success / resolved * 100) if resolved > 0 else 0.0
             self._send_json({
                 "total_alerts": total_alerts,
@@ -102,16 +100,16 @@ class _DashboardHandler(SimpleHTTPRequestHandler):
     def _route_api_alerts(self):
         """Return recent alerts (latest 50), newest first."""
         try:
-            conn = get_conn()
-            rows = conn.execute("""
+            c = execute("""
                 SELECT id, token_address, symbol, alert_mcap, alert_price,
                        target_2x_mcap, hit_2x, resolved, alert_time, peak_mcap
                 FROM alerts
                 ORDER BY id DESC
                 LIMIT 50
-            """).fetchall()
-            conn.close()
-            self._send_json([dict(r) for r in rows])
+            """)
+            rows = _dict_rows(c)
+            close_cursor(c)
+            self._send_json(rows)
         except Exception as e:
             logger.exception("Error fetching alerts")
             self._send_error_json(str(e))

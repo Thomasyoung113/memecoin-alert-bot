@@ -17,7 +17,7 @@ from config import (
     FILTERS_TO_TUNE,
 )
 from bot.models import (
-    get_filter_config, get_all_filter_configs, get_conn,
+    get_filter_config, get_all_filter_configs, execute, close_cursor,
 )
 
 logger = logging.getLogger(__name__)
@@ -27,10 +27,10 @@ _seen_tokens: set = set()
 
 
 def _load_seen_tokens():
-    conn = get_conn()
-    rows = conn.execute("SELECT token_address FROM alerts").fetchall()
-    conn.close()
-    _seen_tokens.update(r["token_address"] for r in rows)
+    c = execute("SELECT token_address FROM alerts")
+    rows = c.fetchall()
+    close_cursor(c)
+    _seen_tokens.update(r[0] for r in rows)
 
 
 def _fetch_token_profiles() -> list[dict]:

@@ -12,7 +12,8 @@ from config import (
     MIN_CALLS_FOR_LEARN,
 )
 from bot.models import (
-    get_conn, save_learning_entry, set_filter_config,
+    execute, close_cursor, _dict_rows, _scalar,
+    save_learning_entry, set_filter_config,
     get_all_filter_configs, get_filter_config,
 )
 
@@ -51,12 +52,11 @@ def analyze_success_by_filter() -> dict:
        "vol_5m_min": {"total": N, "success": N, "rate": X},
        ...}
     """
-    conn = get_conn()
-    rows = conn.execute(
+    c = execute(
         "SELECT scan_snapshot, hit_2x, alert_mcap FROM alerts "
-        "WHERE resolved = 1 AND scan_snapshot IS NOT NULL"
-    ).fetchall()
-    conn.close()
+        "WHERE resolved = 1 AND scan_snapshot IS NOT NULL")
+    rows = _dict_rows(c)
+    close_cursor(c)
 
     if not rows:
         return {}
@@ -104,11 +104,10 @@ def analyze_success_by_mcap_buckets() -> dict:
     Group alerts into MCap buckets and find which range had highest success.
     Returns bucket results.
     """
-    conn = get_conn()
-    rows = conn.execute(
-        "SELECT alert_mcap, hit_2x FROM alerts WHERE resolved = 1"
-    ).fetchall()
-    conn.close()
+    c = execute(
+        "SELECT alert_mcap, hit_2x FROM alerts WHERE resolved = 1")
+    rows = _dict_rows(c)
+    close_cursor(c)
 
     if not rows:
         return {}
@@ -137,11 +136,9 @@ def run_learning_cycle(iteration: int) -> list[dict]:
     Returns list of changes made: [{"filter": name, "old": X, "new": Y, "improved": bool}]
     """
     # Count total resolved calls
-    conn = get_conn()
-    total = conn.execute(
-        "SELECT COUNT(*) FROM alerts WHERE resolved = 1"
-    ).fetchone()[0]
-    conn.close()
+    c = execute("SELECT COUNT(*) FROM alerts WHERE resolved = 1")
+    total = _scalar(c) or 0
+    close_cursor(c)
 
     if total < MIN_CALLS_FOR_LEARN:
         logger.info("Only %d calls resolved, need %d to learn. Skipping.",
@@ -249,14 +246,12 @@ def run_learning_cycle(iteration: int) -> list[dict]:
 
 def get_overall_success_rate() -> float:
     """Get the overall bot success rate from all resolved alerts."""
-    conn = get_conn()
-    total = conn.execute(
-        "SELECT COUNT(*) FROM alerts WHERE resolved = 1"
-    ).fetchone()[0]
-    success = conn.execute(
-        "SELECT COUNT(*) FROM alerts WHERE resolved = 1 AND hit_2x = 1"
-    ).fetchone()[0]
-    conn.close()
+    c = execute("SELECT COUNT(*) FROM alerts WHERE resolved = 1")
+    total = _scalar(c) or 0
+    close_cursor(c)
+    c2 = execute("SELECT COUNT(*) FROM alerts WHERE resolved = 1 AND hit_2x = 1")
+    success = _scalar(c2) or 0
+    close_cursor(c2)
     if total == 0:
         return 0.0
     return (success / total) * 100

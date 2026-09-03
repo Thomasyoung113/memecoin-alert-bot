@@ -162,6 +162,7 @@ def init_db():
             amount_sol      REAL,
             amount_token    REAL,
             price_sol       REAL,
+            price_usd       REAL,
             tx_signature    TEXT,
             status          TEXT DEFAULT 'pending',
             slippage_bps    INTEGER DEFAULT 500,
@@ -186,21 +187,42 @@ def init_db():
     """)
     close_cursor(c)
 
+    # ── Auto-trade config ────────────────────────────────────────
     c = execute("""
-        CREATE TABLE IF NOT EXISTS trades (
+        CREATE TABLE IF NOT EXISTS auto_trade_config (
             id              SERIAL PRIMARY KEY,
-            user_id         INT NOT NULL REFERENCES bot_users(id),
-            wallet_id       INT NOT NULL REFERENCES user_wallets(id),
-            type            TEXT NOT NULL,
+            user_id         INTEGER NOT NULL REFERENCES bot_users(id) ON DELETE CASCADE,
+            wallet_id       INTEGER NOT NULL REFERENCES user_wallets(id) ON DELETE CASCADE,
+            is_enabled      BOOLEAN DEFAULT FALSE,
+            buy_amount_sol  REAL DEFAULT 0.1,
+            max_positions   INTEGER DEFAULT 3,
+            take_profit_pct REAL DEFAULT 100.0,
+            stop_loss_pct   REAL DEFAULT 50.0,
+            cooldown_minutes INTEGER DEFAULT 60,
+            created_at      TIMESTAMP,
+            updated_at      TIMESTAMP,
+            UNIQUE(user_id, wallet_id)
+        )
+    """)
+    close_cursor(c)
+
+    c = execute("""
+        CREATE TABLE IF NOT EXISTS positions (
+            id              SERIAL PRIMARY KEY,
+            user_id         INTEGER NOT NULL REFERENCES bot_users(id) ON DELETE CASCADE,
+            wallet_id       INTEGER NOT NULL REFERENCES user_wallets(id) ON DELETE CASCADE,
+            alert_id        INTEGER REFERENCES alerts(id),
             token_address   TEXT NOT NULL,
             token_symbol    TEXT,
-            amount_sol      REAL,
+            entry_mcap      REAL,
+            entry_price_sol REAL,
+            amount_sol_invested REAL,
             amount_token    REAL,
-            price_sol       REAL,
-            price_usd       REAL,
-            tx_signature    TEXT,
-            status          TEXT DEFAULT 'pending',
-            slippage_bps    INT DEFAULT 500,
+            token_decimals  INTEGER DEFAULT 6,
+            status          TEXT DEFAULT 'open',
+            pnl_pct         REAL,
+            exit_reason     TEXT,
+            exited_at       TIMESTAMP,
             created_at      TIMESTAMP
         )
     """)
@@ -208,10 +230,12 @@ def init_db():
 
     commit()
     logger.info("Database initialized (PostgreSQL)")
-    
+
     # Migrate: add newer columns if missing
     _migrate_add_column("alerts", "hit_loss", "INTEGER DEFAULT 0")
+    _migrate_add_column("alerts", "last_milestone", "REAL DEFAULT 0")
     _migrate_add_column("user_wallets", "slippage_bps", "INTEGER DEFAULT 500")
+    _migrate_add_column("trades", "price_usd", "REAL")
 
 
 def _migrate_add_column(table, column, col_type):
@@ -515,6 +539,27 @@ def get_trade_by_sig(signature):
     return rows[0] if rows else None
 
 
+def get_last_buy_trade(user_id, token_address):
+    """Most recent recorded buy trade for a user + token (for sell PnL entry)."""
+    c = execute(f"SELECT {_TRADE_COLS} FROM trades "
+                "WHERE user_id = %s AND token_address = %s "
+                "AND type = 'buy' AND price_sol IS NOT NULL "
+                "ORDER BY created_at DESC LIMIT 1",
+                (user_id, token_address))
+    rows = _dict_rows(c)
+    close_cursor(c)
+    return rows[0] if rows else None
+
+
+def get_alert_for_token(token_address):
+    """The bot's alert record for a token (symbol + entry mcap), if any."""
+    c = execute("SELECT id, symbol, alert_mcap FROM alerts "
+                "WHERE token_address = %s", (token_address,))
+    rows = _dict_rows(c)
+    close_cursor(c)
+    return rows[0] if rows else None
+
+
 def update_trade_status(trade_id, status, tx_sig=None):
     """Update the status (and optionally tx_signature) of a trade."""
     if tx_sig is not None:
@@ -525,5 +570,151 @@ def update_trade_status(trade_id, status, tx_sig=None):
     else:
         c = execute("UPDATE trades SET status = %s WHERE id = %s",
                     (status, trade_id))
+    close_cursor(c)
+    commit()
+
+
+# ── Auto-trade helpers (Phase 3) ──────────────────────────────────────
+
+_AUTO_TRADE_FIELDS = ("is_enabled", "buy_amount_sol", "max_positions",
+                      "take_profit_pct", "stop_loss_pct", "cooldown_minutes")
+
+
+def get_auto_trade_config(user_id, wallet_id=None):
+    """Get a user's auto-trade config (for a specific wallet, or any)."""
+    if wallet_id is None:
+        c = execute("SELECT * FROM auto_trade_config WHERE user_id = %s",
+                    (user_id,))
+    else:
+        c = execute("SELECT * FROM auto_trade_config "
+                    "WHERE user_id = %s AND wallet_id = %s",
+                    (user_id, wallet_id))
+    rows = _dict_rows(c)
+    close_cursor(c)
+    return rows[0] if rows else None
+
+
+def upsert_auto_trade_config(user_id, wallet_id, updates=None):
+    """Create the config row with defaults if missing, then apply updates."""
+    now = datetime.now(timezone.utc).isoformat()
+    if get_auto_trade_config(user_id, wallet_id) is None:
+        c = execute("""
+            INSERT INTO auto_trade_config (user_id, wallet_id, created_at, updated_at)
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT (user_id, wallet_id) DO NOTHING
+        """, (user_id, wallet_id, now, now))
+        close_cursor(c)
+        commit()
+    if updates:
+        sets, params = [], []
+        for key, value in updates.items():
+            if key in _AUTO_TRADE_FIELDS:
+                sets.append(f"{key} = %s")
+                params.append(value)
+        if sets:
+            sets.append("updated_at = %s")
+            params.extend([now, user_id, wallet_id])
+            c = execute(
+                f"UPDATE auto_trade_config SET {', '.join(sets)} "
+                "WHERE user_id = %s AND wallet_id = %s",
+                tuple(params))
+            close_cursor(c)
+            commit()
+    return get_auto_trade_config(user_id, wallet_id)
+
+
+def get_enabled_auto_traders():
+    """All enabled auto-trade configs joined with their wallet's public key."""
+    c = execute("""
+        SELECT cfg.id, cfg.user_id, cfg.wallet_id, cfg.buy_amount_sol,
+               cfg.max_positions, cfg.take_profit_pct, cfg.stop_loss_pct,
+               cfg.cooldown_minutes, w.public_key, w.label, w.slippage_bps
+        FROM auto_trade_config cfg
+        JOIN user_wallets w ON w.id = cfg.wallet_id
+        WHERE cfg.is_enabled = TRUE
+    """)
+    rows = _dict_rows(c)
+    close_cursor(c)
+    return rows
+
+
+def get_wallet_by_id(wallet_id, include_privkey=False):
+    cols = _WALLET_FULL_COLS if include_privkey else _WALLET_READ_COLS
+    c = execute(f"SELECT {cols} FROM user_wallets WHERE id = %s", (wallet_id,))
+    rows = _dict_rows(c)
+    close_cursor(c)
+    return rows[0] if rows else None
+
+
+def count_open_positions(user_id, wallet_id):
+    c = execute("SELECT COUNT(*) FROM positions "
+                "WHERE user_id = %s AND wallet_id = %s AND status = 'open'",
+                (user_id, wallet_id))
+    n = _scalar(c) or 0
+    close_cursor(c)
+    return n
+
+
+def get_last_position_time(user_id, wallet_id):
+    """Timestamp of the most recent position (open or closed) for cooldowns."""
+    c = execute("SELECT MAX(created_at) FROM positions "
+                "WHERE user_id = %s AND wallet_id = %s", (user_id, wallet_id))
+    last = _scalar(c)
+    close_cursor(c)
+    return last
+
+
+def create_position(user_id, wallet_id, alert_id, token_address, token_symbol,
+                    entry_mcap, entry_price_sol, amount_sol_invested,
+                    amount_token, token_decimals):
+    """Record an opened auto-trade position. Returns the position id.
+
+    amount_token is in human-readable units (raw amount / 10**decimals)."""
+    now = datetime.now(timezone.utc).isoformat()
+    c = execute("""
+        INSERT INTO positions (user_id, wallet_id, alert_id, token_address,
+                               token_symbol, entry_mcap, entry_price_sol,
+                               amount_sol_invested, amount_token,
+                               token_decimals, status, created_at)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'open', %s)
+        RETURNING id
+    """, (user_id, wallet_id, alert_id, token_address, token_symbol,
+          entry_mcap, entry_price_sol, amount_sol_invested, amount_token,
+          token_decimals, now))
+    pos_id = _scalar(c)
+    close_cursor(c)
+    commit()
+    return pos_id
+
+
+def get_open_positions(token_address=None):
+    if token_address:
+        c = execute("SELECT * FROM positions "
+                    "WHERE status = 'open' AND token_address = %s",
+                    (token_address,))
+    else:
+        c = execute("SELECT * FROM positions WHERE status = 'open'")
+    rows = _dict_rows(c)
+    close_cursor(c)
+    return rows
+
+
+def has_any_position(user_id, wallet_id, token_address):
+    """True if this wallet already has a position (open or closed) on the token."""
+    c = execute("SELECT 1 FROM positions "
+                "WHERE user_id = %s AND wallet_id = %s AND token_address = %s "
+                "LIMIT 1", (user_id, wallet_id, token_address))
+    row = c.fetchone()
+    close_cursor(c)
+    return row is not None
+
+
+def close_position(position_id, pnl_pct=None, exit_reason=None):
+    now = datetime.now(timezone.utc).isoformat()
+    c = execute("""
+        UPDATE positions
+        SET status = 'closed', pnl_pct = %s, exit_reason = %s, exited_at = %s
+        WHERE id = %s
+    """, (pnl_pct, exit_reason, now, position_id))
     close_cursor(c)
     commit()

@@ -31,7 +31,7 @@ from solders.commitment_config import CommitmentLevel
 from solders.rpc.responses import SendTransactionPreflightFailure
 from solders.rpc.config import RpcSendTransactionConfig
 
-from config import HELIUS_RPC, SOLANA_RPC
+from bot import helius
 
 logger = logging.getLogger(__name__)
 
@@ -159,7 +159,7 @@ def submit_transaction(base64_tx: str, keypair_bytes: bytes) -> str | None:
         sig = tx.sign([keypair])
 
         # Send to RPC
-        url = HELIUS_RPC or SOLANA_RPC
+        url = helius.HELIUS_RPC or helius.SOLANA_RPC
         payload = {
             "jsonrpc": "2.0",
             "id": 1,
@@ -198,7 +198,7 @@ def check_transaction_status(tx_signature: str) -> dict:
 
     Returns dict with keys: confirmed (bool), slot (int), error (str or None).
     """
-    url = HELIUS_RPC or SOLANA_RPC
+    url = helius.HELIUS_RPC or helius.SOLANA_RPC
     payload = {
         "jsonrpc": "2.0",
         "id": 1,
@@ -310,7 +310,7 @@ def sell_token(
 
 def get_token_decimals(mint_address: str) -> int:
     """Fetch token decimals from Solana chain."""
-    url = HELIUS_RPC or SOLANA_RPC
+    url = helius.HELIUS_RPC or helius.SOLANA_RPC
     payload = {
         "jsonrpc": "2.0",
         "id": 1,

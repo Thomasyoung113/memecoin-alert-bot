@@ -17,10 +17,6 @@ from config import (
 from bot.models import init_db, save_alert, get_stats
 from bot.scanner import scan
 from bot.checker import is_safe
-from bot.telegram import (
-    send_alert, send_resolved, send_learning_update, send_update,
-    send_pnl_card, send_photo,
-)
 from bot.tracker import check_outcomes, force_resolve_stale
 from bot.insider_tracker import check_insider_selling_for_alerts
 from bot.learner import run_learning_cycle, get_overall_success_rate
@@ -29,6 +25,12 @@ from bot.helius import init_helius
 from bot.wide_scanner import start_wide_scanner
 from bot.whale_watcher import start_whale_watcher
 from bot.smart_money import get_smart_wallets_for_token, mark_token_success_for_wallets
+from bot.milestones import check_milestones
+from bot.auto_trader import maybe_auto_buy, maybe_auto_sell, check_all_positions
+from bot.telegram import (
+    send_alert, send_resolved, send_learning_update, send_update,
+    send_pnl_card, send_photo, send_milestone_card,
+)
 from dashboard.server import start_dashboard
 
 # ── Logging ───────────────────────────────────────────────────────────
@@ -46,6 +48,31 @@ def _fmt_interval(seconds: int) -> str:
     if seconds >= 60:
         return f"{seconds//60}m"
     return f"{seconds}s"
+
+
+def _announce_sell(sell: dict):
+    """Announce an auto-sell in Telegram: text update + PnL card."""
+    pnl = sell.get("pnl_pct") or 0.0
+    sign = "+" if pnl >= 0 else ""
+    send_update(f"🤖 Auto-sold ${sell['symbol']}\n"
+                f"Reason: {sell['reason']}\n"
+                f"PnL: {sign}{pnl:.1f}%\n"
+                f"Tx: <code>{sell['tx_sig'][:16]}...</code>")
+    try:
+        send_pnl_card(
+            symbol=sell["symbol"],
+            pnl_pct=pnl,
+            entry_mcap=sell.get("entry_mcap") or 0,
+            current_mcap=sell.get("current_mcap"),
+            peak_mcap=sell.get("current_mcap"),
+            duration=sell.get("duration"),
+            caption_title=f"💰 SOLD ${sell['symbol']} — {sign}{pnl:.1f}%",
+            multiplier=sell.get("multiplier"),
+            sol_spent=sell.get("sol_spent"),
+            sol_received=sell.get("sol_received"),
+        )
+    except Exception as e:
+        logger.error("Sell PnL card failed for %s: %s", sell["symbol"], e)
 
 
 def main():
@@ -128,6 +155,15 @@ def main():
                     snapshot, safety_detail, smart_wallets,
                 )
 
+                try:
+                    auto_trades = maybe_auto_buy(token_address, symbol, mcap, price, snapshot)
+                    for at in auto_trades:
+                        send_update(f"🤖 Auto-bought ${symbol}\n"
+                                    f"Amount: ◎ {at['amount_sol']:.4f}\n"
+                                    f"Tx: <code>{at['tx_sig'][:16]}...</code>")
+                except Exception as e:
+                    logger.error("Auto-buy hook failed for %s: %s", symbol, e)
+
                 logger.info("  └─ ✅ Alert sent! Target: $%.0f"
                             + (" (Smart Money: %d wallets)" % len(smart_wallets)
                                if smart_wallets else ""),
@@ -168,6 +204,11 @@ def main():
                         except Exception as e:
                             logger.error("Failed to generate PnL card for %s: %s",
                                          r["symbol"], e)
+                    try:
+                        for as_ in maybe_auto_sell(r):
+                            _announce_sell(as_)
+                    except Exception as e:
+                        logger.error("Auto-sell hook failed for %s: %s", r['symbol'], e)
                     # Phase 2: Update smart wallet stats based on resolution
                     if r["hit_2x"]:
                         mark_token_success_for_wallets(r.get("token_address", ""))
@@ -176,7 +217,27 @@ def main():
                     logger.info("Track record after resolution: %d/%d — %.1f%%",
                                 total_success, total_alerts, success_rate)
 
-                # ── 2b. Check insider selling on unresolved alerts ──
+                # ── 2b. Auto-trader: TP/SL sweep on open positions ──
+                try:
+                    for sell in check_all_positions():
+                        _announce_sell(sell)
+                except Exception as e:
+                    logger.error("Position sweep failed: %s", e)
+
+                # ── 2c. Milestone cards: 1.5x → 2x → ... → 100x ─────
+                try:
+                    for ev in check_milestones():
+                        send_milestone_card(
+                            symbol=ev["symbol"],
+                            multiplier=ev["multiplier"],
+                            alert_mcap=ev["alert_mcap"],
+                            current_mcap=ev["current_mcap"],
+                            duration=ev.get("duration"),
+                        )
+                except Exception as e:
+                    logger.error("Milestone check failed: %s", e)
+
+                # ── 2d. Check insider selling on unresolved alerts ──
                 insider_alerts = check_insider_selling_for_alerts()
                 for ia in insider_alerts:
                     mcap_str = (f"${ia['current_mcap']:,.0f}"

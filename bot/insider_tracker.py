@@ -9,7 +9,7 @@ import time
 import requests
 
 from config import RUGCHECK_BASE
-from bot.models import get_conn, get_pending_alerts
+from bot.models import execute, close_cursor, commit, _dict_rows, get_pending_alerts
 
 logger = logging.getLogger(__name__)
 
@@ -71,14 +71,12 @@ def _fetch_top_holders(token_address: str) -> list[dict] | None:
 
 def _get_holder_baseline(alert_id: int) -> list[dict] | None:
     """Read the holder baseline JSON from the DB for a given alert."""
-    conn = get_conn()
-    row = conn.execute(
-        "SELECT holder_baseline FROM alerts WHERE id = ?", (alert_id,)
-    ).fetchone()
-    conn.close()
-    if row and row["holder_baseline"]:
+    c = execute("SELECT holder_baseline FROM alerts WHERE id = %s", (alert_id,))
+    rows = _dict_rows(c)
+    close_cursor(c)
+    if rows and rows[0]["holder_baseline"]:
         try:
-            return json.loads(row["holder_baseline"])
+            return json.loads(rows[0]["holder_baseline"])
         except (json.JSONDecodeError, TypeError):
             return None
     return None
@@ -86,13 +84,12 @@ def _get_holder_baseline(alert_id: int) -> list[dict] | None:
 
 def _set_holder_baseline(alert_id: int, holders: list[dict]):
     """Persist holder baseline JSON to the DB."""
-    conn = get_conn()
-    conn.execute(
-        "UPDATE alerts SET holder_baseline = ? WHERE id = ?",
+    c = execute(
+        "UPDATE alerts SET holder_baseline = %s WHERE id = %s",
         (json.dumps(holders), alert_id),
     )
-    conn.commit()
-    conn.close()
+    close_cursor(c)
+    commit()
 
 
 def check_insider_selling(token_address: str, snapshot: dict) -> dict:
@@ -119,19 +116,19 @@ def check_insider_selling(token_address: str, snapshot: dict) -> dict:
         }
 
     # ── Look up alert and its baseline ────────────────────────────────
-    conn = get_conn()
-    alert = conn.execute(
-        "SELECT id, holder_baseline FROM alerts WHERE token_address = ?",
-        (token_address,),
-    ).fetchone()
-    conn.close()
+    c = execute(
+        "SELECT id, holder_baseline FROM alerts WHERE token_address = %s",
+        (token_address,))
+    alerts = _dict_rows(c)
+    close_cursor(c)
 
-    if not alert:
+    if not alerts:
         return {
             "is_dumping": False,
             "details": "Token not found in alerts table",
         }
 
+    alert = alerts[0]
     baseline = _get_holder_baseline(alert["id"])
 
     if baseline is None:

@@ -1,252 +1,342 @@
 """
-pnl_card.py — Generates a custom GEMBOT-branded PnL card when a token hits 2x.
+pnl_card.py — GEMBOT PnL / milestone card generator.
 
-Uses the diagonal card layout from degen-pnl-bot/pnl_card.py (1255x838):
-left panel = mascot/art, right panel = stats with GEMBOT branding.
+Design follows the researched spec for bot PnL cards (Trady / Maestro /
+GemsBot conventions measured from a 67-card reference corpus):
+
+  Canvas     1280x840, ~3:2 landscape
+  Background #0d0d12 -> #14161e vertical gradient + accent radial tint
+  Border     rounded 20px, 4-layer glow border
+  Numbers    JetBrains Mono Bold (all of them)
+  Colors     win #00ff88 · loss #ff3b3b · milestone gold #ffd24a
+             labels #8a8f98 · values #ffffff · Solana badge #0099ff
+
+  Sell card order:   header (avatar+ticker+SOL badge+brand) -> hero PnL%
+                     -> "Received ◎ X" -> sparkline -> detail rows
+                     (multiplier, entry→exit mcap, spent/received, held,
+                     wallet tag) -> footer t.me/GEMBOT
+
+  Milestone card:    the multiplier IS the card (~200px, gold->green
+                     gradient fill + glow). Escalation tiers:
+                       1.5x-3x  regular card, multiplier as gold badge
+                       5x+      gold border tint + rocket glyph
+                       10x+     GEM CALL ribbon + confetti
+                       50x+     full celebration (purple accents, max confetti)
+
+Implementation note: this Pillow build does NOT alpha-blend ImageDraw fills
+on the base image (a translucent fill overwrites pixels), so every
+translucent element goes through an overlay layer composited with
+alpha_composite().
 
 Usage:
     from bot.pnl_card import generate_pnl_card
-  
-    img_bytes = generate_pnl_card(
-        token_symbol="PEPE",
-        pnl_pct=142.5,
-        entry_mcap=250_000,
-        current_mcap=607_000,
-        peak_mcap=700_000,
-        duration="2h 14m",
-        wallet="7xKX...9fQa",
-        is_win=True,
-    )
-    # send via Telegram send_photo(photo=img_bytes)
+    png_bytes = generate_pnl_card(token_symbol="PEPE", pnl_pct=312.4, ...)
 """
 
 import io
 import math
-import random
-from PIL import Image, ImageDraw, ImageFont, ImageFilter
-
-W2, H2 = 1255, 838
-split_x = int(W2 * 0.46)
-
-# ── Color palette (GEMBOT dark theme) ────────────────────────────────
-GREEN = (44, 224, 128)
-RED = (255, 82, 82)
-NEON_GREEN = (0, 255, 136, 180)
-NEON_RED = (255, 59, 59, 180)
-BG_TOP = (8, 10, 14)
-BG_BOTTOM = (5, 6, 9)
-CARD = (13, 17, 23)
-MUTED = (140, 150, 160)
-WHITE = (240, 242, 245)
-GEMBOT_BLUE = (1, 131, 189)  # From the logo accent
-
-# ── Fonts ─────────────────────────────────────────────────────────────
 import os
-_FONT_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "assets")
-F_BOLD = os.path.join(_FONT_DIR, "JetBrainsMono-Bold.ttf")
-F_REG = F_BOLD
-F_MONO = F_BOLD
+import random
+
+from PIL import Image, ImageDraw, ImageFilter, ImageFont
+
+W, H = 1280, 840
+MARGIN = 56
+RADIUS = 20
+
+# ── Palette (research spec) ───────────────────────────────────────────
+WIN = (0, 255, 136)          # #00ff88
+LOSS = (255, 59, 59)         # #ff3b3b
+GOLD = (255, 210, 74)        # #ffd24a
+PURPLE = (171, 99, 250)      # celebration accent (50x+)
+LABEL = (138, 143, 152)      # #8a8f98
+VALUE = (255, 255, 255)
+SOL_BLUE = (0, 153, 255)     # #0099ff
+BG_TOP = (13, 13, 18)        # #0d0d12
+BG_BOTTOM = (20, 22, 30)     # #14161e
+BRAND = (0, 255, 136)
+INK = (10, 10, 14)
+
+CONFETTI_COLORS = [GOLD, WIN, SOL_BLUE, (255, 122, 69), PURPLE, VALUE]
+
+_FONT_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)),
+                          "assets", "JetBrainsMono-Bold.ttf")
+
+_font_cache: dict[int, ImageFont.FreeTypeFont] = {}
 
 
-def _font(path, size):
-    return ImageFont.truetype(path, size)
+def _font(size: int) -> ImageFont.FreeTypeFont:
+    if size not in _font_cache:
+        _font_cache[size] = ImageFont.truetype(_FONT_PATH, size)
+    return _font_cache[size]
 
 
-def _vgradient(draw, box, top_color, bottom_color):
-    x0, y0, x1, y1 = box
-    height = y1 - y0
-    for i in range(height):
-        t = i / height
-        r = int(top_color[0] + (bottom_color[0] - top_color[0]) * t)
-        g = int(top_color[1] + (bottom_color[1] - top_color[1]) * t)
-        b = int(top_color[2] + (bottom_color[2] - top_color[2]) * t)
-        draw.line([(x0, y0 + i), (x1, y0 + i)], fill=(r, g, b))
+def _fmt_mcap(n) -> str:
+    if n is None:
+        return "—"
+    if n >= 1_000_000_000:
+        return f"${n/1_000_000_000:.2f}B"
+    if n >= 1_000_000:
+        return f"${n/1_000_000:.2f}M"
+    if n >= 1_000:
+        return f"${n/1_000:.1f}K"
+    return f"${n:.0f}"
 
 
-def _shade(img, box, base_color, light=(-0.35, -0.4), intensity=95):
-    x0, y0, x1, y1 = box
-    w, h = int(x1 - x0), int(y1 - y0)
-    if w <= 1 or h <= 1:
-        return
-    patch = Image.new("RGB", (w, h), base_color)
-    hi = tuple(min(255, c + intensity) for c in base_color)
-    lo = tuple(max(0, c - intensity) for c in base_color)
-    maxr = math.hypot(w, h) * 0.75
-    grad_hi = Image.new("L", (w, h), 0)
-    gd = ImageDraw.Draw(grad_hi)
-    cx, cy = w / 2 + light[0] * w / 2, h / 2 + light[1] * h / 2
-    for r in range(int(maxr), 0, -6):
-        gd.ellipse([cx - r, cy - r, cx + r, cy + r], fill=int(255 * (1 - r / maxr)))
-    grad_hi = grad_hi.filter(ImageFilter.GaussianBlur(w * 0.18 + 1))
-    patch = Image.composite(Image.new("RGB", (w, h), hi), patch, grad_hi)
-    grad_lo = Image.new("L", (w, h), 0)
-    gd2 = ImageDraw.Draw(grad_lo)
-    cx2, cy2 = w / 2 - light[0] * w / 2, h / 2 - light[1] * h / 2
-    for r in range(int(maxr), 0, -6):
-        gd2.ellipse([cx2 - r, cy2 - r, cx2 + r, cy2 + r], fill=int(185 * (1 - r / maxr)))
-    grad_lo = grad_lo.filter(ImageFilter.GaussianBlur(w * 0.2 + 1))
-    patch = Image.composite(Image.new("RGB", (w, h), lo), patch, grad_lo)
-    spec = Image.new("L", (w, h), 0)
-    sd = ImageDraw.Draw(spec)
-    scx, scy = w / 2 + light[0] * w * 0.55, h / 2 + light[1] * h * 0.55
-    sr = min(w, h) * 0.16
-    sd.ellipse([scx - sr, scy - sr, scx + sr, scy + sr], fill=200)
-    spec = spec.filter(ImageFilter.GaussianBlur(sr * 0.6))
-    patch = Image.composite(Image.new("RGB", (w, h), (255, 255, 255)), patch, spec)
-    mask = Image.new("L", (w, h), 0)
-    ImageDraw.Draw(mask).ellipse([0, 0, w - 1, h - 1], fill=255)
-    img.paste(patch, (int(x0), int(y0)), mask)
+def _fmt_mult(m) -> str:
+    return f"{m:g}x"
 
 
-def _shaded_circle(img, cx, cy, r, color, **kw):
-    _shade(img, (cx - r, cy - r, cx + r, cy + r), color, **kw)
+# ── Canvas primitives ─────────────────────────────────────────────────
+
+def _background(accent: tuple, accent_alpha: int = 26) -> Image.Image:
+    """Vertical gradient + soft radial tint of the accent color."""
+    img = Image.new("RGB", (W, H), BG_TOP)
+    d = ImageDraw.Draw(img)
+    for y in range(H):
+        t = y / H
+        d.line([(0, y), (W, y)],
+               fill=tuple(int(a + (b - a) * t) for a, b in zip(BG_TOP, BG_BOTTOM)))
+    tint = Image.new("L", (W, H), 0)
+    td = ImageDraw.Draw(tint)
+    cx, cy, r = W * 0.78, H * 0.30, W * 0.55
+    for rr in range(int(r), 0, -8):
+        td.ellipse([cx - rr, cy - rr, cx + rr, cy + rr],
+                   fill=int(accent_alpha * (1 - rr / r)))
+    tint = tint.filter(ImageFilter.GaussianBlur(60))
+    overlay = Image.new("RGB", (W, H), accent)
+    img = Image.composite(overlay, img, tint)
+    return img.convert("RGBA")
 
 
-# ── Mascots (simplified versions for alert context) ──────────────────
-
-def _draw_bull(img, draw, box, is_win):
-    x0, y0, x1, y1 = box
-    w, h = x1 - x0, y1 - y0
-    cx, cy = x0 + w / 2, y0 + h * 0.55
-    color = (50, 130, 90) if is_win else (110, 90, 90)
-    outline = (15, 20, 18)
-    head_w, head_h = w * 0.6, h * 0.5
-    _shade(img, (cx - head_w / 2, cy - head_h / 2, cx + head_w / 2, cy + head_h / 2), color)
-    draw.ellipse([cx - head_w / 2, cy - head_h / 2, cx + head_w / 2, cy + head_h / 2], outline=outline, width=5)
-    accent = GREEN if is_win else RED
-    eye_y = cy - head_h * 0.08
-    for sx in (cx - w * 0.15, cx + w * 0.15):
-        if is_win:
-            draw.ellipse([sx - w * 0.04, eye_y - w * 0.04, sx + w * 0.04, eye_y + w * 0.04], fill=(255, 255, 220))
-            draw.ellipse([sx - w * 0.015, eye_y - w * 0.015, sx + w * 0.015, eye_y + w * 0.015], fill=(20, 20, 18))
-        else:
-            draw.arc([sx - w * 0.04, eye_y - w * 0.01, sx + w * 0.04, eye_y + w * 0.06], 180, 360, fill=accent, width=4)
-    mouth_y = cy + head_h * 0.28
-    if is_win:
-        draw.arc([cx - w * 0.08, mouth_y - w * 0.02, cx + w * 0.08, mouth_y + w * 0.06], 10, 170, fill=outline, width=4)
-    else:
-        draw.arc([cx - w * 0.08, mouth_y + w * 0.02, cx + w * 0.08, mouth_y + w * 0.08], 190, 350, fill=outline, width=4)
-    for sign in (-1, 1):
-        ear_x = cx + sign * head_w * 0.4
-        ear_y = cy - head_h * 0.4
-        draw.ellipse([ear_x - w * 0.08, ear_y - w * 0.08, ear_x + w * 0.08, ear_y + w * 0.08], fill=color, outline=outline, width=3)
-        horn_x = cx + sign * head_w * 0.3
-        horn_y = cy - head_h * 0.52
-        draw.polygon([(horn_x - w * 0.03, horn_y), (horn_x + w * 0.03, horn_y), (horn_x, horn_y - w * 0.1)], fill=(200, 200, 195), outline=outline, width=2)
+def _overlay(img: Image.Image) -> tuple[Image.Image, ImageDraw.ImageDraw]:
+    """Fresh transparent layer + its draw handle (composite when done)."""
+    layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    return layer, ImageDraw.Draw(layer)
 
 
-def _draw_bear(img, draw, box, is_win):
-    x0, y0, x1, y1 = box
-    w, h = x1 - x0, y1 - y0
-    cx, cy = x0 + w / 2, y0 + h * 0.55
-    color = (100, 80, 80) if not is_win else (130, 140, 135)
-    outline = (20, 15, 15)
-    head_w, head_h = w * 0.6, h * 0.5
-    _shade(img, (cx - head_w / 2, cy - head_h / 2, cx + head_w / 2, cy + head_h / 2), color)
-    draw.ellipse([cx - head_w / 2, cy - head_h / 2, cx + head_w / 2, cy + head_h / 2], outline=outline, width=5)
-    for sx in (cx - w * 0.28, cx + w * 0.28):
-        _shaded_circle(img, sx, cy - h * 0.4, w * 0.12, color)
-        draw.ellipse([sx - w * 0.12, cy - h * 0.4 - w * 0.12, sx + w * 0.12, cy - h * 0.4 + w * 0.12], outline=outline, width=3)
-    snout_w, snout_h = w * 0.3, h * 0.16
-    snout_cy = cy + head_h * 0.25
-    _shade(img, (cx - snout_w / 2, snout_cy - snout_h / 2, cx + snout_w / 2, snout_cy + snout_h / 2), (180, 165, 155))
-    draw.ellipse([cx - snout_w / 2, snout_cy - snout_h / 2, cx + snout_w / 2, snout_cy + snout_h / 2], outline=outline, width=3)
-    draw.ellipse([cx - w * 0.02, snout_cy - w * 0.02, cx + w * 0.02, snout_cy + w * 0.02], fill=outline)
-    accent = GREEN if is_win else RED
-    eye_y = cy - head_h * 0.08
-    for sx in (cx - w * 0.14, cx + w * 0.14):
-        if is_win:
-            draw.arc([sx - w * 0.04, eye_y - w * 0.02, sx + w * 0.04, eye_y + w * 0.04], 200, 340, fill=outline, width=4)
-        else:
-            draw.line([(sx - w * 0.04, eye_y - w * 0.02), (sx + w * 0.04, eye_y + w * 0.02)], fill=accent, width=4)
+def _composite(img: Image.Image, layer: Image.Image):
+    img.alpha_composite(layer)
 
 
-def _draw_chart_whale(img, draw, box, is_win):
-    """A whale mascot for big wins — chart whale."""
-    x0, y0, x1, y1 = box
-    w, h = x1 - x0, y1 - y0
-    cx, cy = x0 + w / 2, y0 + h * 0.55
-    color = (70, 130, 180) if is_win else (80, 85, 95)
-    outline = (12, 18, 28)
-    body_w, body_h = w * 0.7, h * 0.45
-    _shade(img, (cx - body_w / 2, cy - body_h / 2, cx + body_w / 2, cy + body_h / 2), color)
-    draw.ellipse([cx - body_w / 2, cy - body_h / 2, cx + body_w / 2, cy + body_h / 2], outline=outline, width=5)
-    draw.polygon([(cx + body_w * 0.25, cy - body_h * 0.35), (cx + body_w * 0.4, cy - body_h * 0.7), (cx + body_w * 0.5, cy - body_h * 0.3)],
-                 fill=color, outline=outline, width=3)
-    accent = GREEN if is_win else RED
-    eye_cx = cx - body_w * 0.2
-    eye_cy = cy - body_h * 0.1
-    if is_win:
-        draw.ellipse([eye_cx - w * 0.03, eye_cy - w * 0.03, eye_cx + w * 0.03, eye_cy + w * 0.03], fill=(20, 20, 22))
-        draw.ellipse([eye_cx - w * 0.012, eye_cy - w * 0.04, eye_cx + w * 0.012, eye_cy - w * 0.02], fill=(255, 255, 255))
-    else:
-        draw.line([(eye_cx - w * 0.03, eye_cy - w * 0.02), (eye_cx + w * 0.03, eye_cy + w * 0.02)], fill=accent, width=4)
-    mouth_y = cy + body_h * 0.25
-    if is_win:
-        draw.arc([cx - body_w * 0.25, mouth_y - h * 0.04, cx + body_w * 0.05, mouth_y + h * 0.07], 10, 90, fill=outline, width=4)
-        for i in range(3):
-            sy = cy - body_h * 0.5 - i * h * 0.05
-            r = w * 0.012 * (3 - i)
-            draw.ellipse([cx + body_w * 0.3 - r, sy - r, cx + body_w * 0.3 + r, sy + r], fill=(180, 210, 235))
-    else:
-        draw.line([(cx - body_w * 0.18, mouth_y + h * 0.02), (cx + body_w * 0.02, mouth_y)], fill=outline, width=4)
+def _blend_rect(img: Image.Image, box, radius, fill_color, alpha,
+                outline_color=None, outline_alpha=0, width=1):
+    """Rounded rect with TRUE alpha blending (overlay + composite)."""
+    layer, d = _overlay(img)
+    d.rounded_rectangle(box, radius=radius,
+                        fill=fill_color + (alpha,))
+    if outline_color and outline_alpha:
+        d.rounded_rectangle(box, radius=radius,
+                            outline=outline_color + (outline_alpha,), width=width)
+    _composite(img, layer)
 
 
-MASCOTS = [_draw_bull, _draw_bear, _draw_chart_whale]
+def _blend_line(img: Image.Image, xy0, xy1, color, alpha, width=1):
+    layer, d = _overlay(img)
+    d.line([xy0, xy1], fill=color + (alpha,), width=width)
+    _composite(img, layer)
 
 
-def _mascot_panel(size, is_win, seed=None, mascot=None):
-    w, h = size
-    layer = Image.new("RGB", size, (10, 12, 14))
-    draw = ImageDraw.Draw(layer)
-    accent = GREEN if is_win else RED
-    base = (16, 38, 28) if is_win else (38, 16, 16)
-    _vgradient(draw, (0, 0, w, h), base, (10, 12, 14))
-    glow = Image.new("RGBA", size, (0, 0, 0, 0))
-    gd = ImageDraw.Draw(glow)
-    gd.ellipse([w * 0.1, h * 0.12, w * 0.9, h * 0.88], fill=(*accent, 45))
-    glow = glow.filter(ImageFilter.GaussianBlur(90))
-    layer.paste(glow, (0, 0), glow)
-    draw = ImageDraw.Draw(layer)
+def _glow_border(img: Image.Image, accent: tuple):
+    """4-layer rounded glow border."""
+    layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    d = ImageDraw.Draw(layer)
+    for inset, width, alpha in [(6, 10, 90), (12, 7, 60), (18, 5, 38), (24, 3, 22)]:
+        d.rounded_rectangle([inset, inset, W - inset, H - inset],
+                            radius=RADIUS + inset,
+                            outline=accent + (alpha,), width=width)
+    layer = layer.filter(ImageFilter.GaussianBlur(7))
+    img.alpha_composite(layer)
+    d2 = ImageDraw.Draw(img)
+    d2.rounded_rectangle([4, 4, W - 4, H - 4], radius=RADIUS,
+                         outline=accent + (255,), width=2)
+
+
+def _glow(img: Image.Image, xy, text, font, color,
+          glow_radius: int = 18, glow_alpha: int = 160,
+          align: str = "left") -> tuple[int, int]:
+    """Glow halo ONLY (no solid text) — pair with a text draw after."""
+    x, y = xy
+    bbox = font.getbbox(text)
+    tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+    if align == "center":
+        x = x - tw / 2
+    pad = glow_radius * 3
+    layer = Image.new("RGBA", (int(tw) + pad * 2, int(th) + pad * 2), (0, 0, 0, 0))
+    ld = ImageDraw.Draw(layer)
+    ld.text((pad - bbox[0], pad - bbox[1]), text, font=font, fill=color + (glow_alpha,))
+    layer = layer.filter(ImageFilter.GaussianBlur(glow_radius))
+    img.alpha_composite(layer, (int(x - pad), int(y - pad)))
+    return int(x), int(y)
+
+
+def _text(img: Image.Image, xy, text, font, color,
+          align: str = "left", anchor_xy: str = "la") -> tuple[int, int]:
+    """Solid text; align='center' centers horizontally on xy[0]."""
+    x, y = xy
+    if align == "center":
+        bbox = font.getbbox(text)
+        x = x - (bbox[2] - bbox[0]) / 2 - bbox[0]
+        y = y - bbox[1]
+    d = ImageDraw.Draw(img)
+    d.text((x, y), text, font=font, fill=color + (255,))
+    return int(x), int(y)
+
+
+def _gradient_text(img: Image.Image, xy, text, font, top_color, bottom_color,
+                   glow_color=None, align: str = "center") -> tuple[int, int]:
+    """Vertical gradient fill inside the glyphs + soft glow behind."""
+    x, y = xy
+    bbox = font.getbbox(text)
+    tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+    if align == "center":
+        x = x - tw / 2
+    if glow_color:
+        _glow(img, (x, y), text, font, glow_color, glow_radius=26, glow_alpha=110)
+    mask = Image.new("L", (int(tw) + 4, int(th) + 4), 0)
+    md = ImageDraw.Draw(mask)
+    md.text((-bbox[0] + 2, -bbox[1] + 2), text, font=font, fill=255)
+    grad = Image.new("RGB", mask.size, top_color)
+    gd = ImageDraw.Draw(grad)
+    for gy in range(mask.size[1]):
+        t = gy / max(1, mask.size[1])
+        gd.line([(0, gy), (mask.size[0], gy)],
+                fill=tuple(int(a + (b - a) * t) for a, b in zip(top_color, bottom_color)))
+    img.paste(grad, (int(x), int(y)), mask)
+    return int(x), int(y)
+
+
+def _confetti(img: Image.Image, seed, count: int, region, colors=None):
     rnd = random.Random(seed)
-    fn = mascot if mascot is not None else rnd.choice(MASCOTS)
-    mascot_box = (w * 0.08, h * 0.16, w * 0.92, h * 0.95)
-    shadow = Image.new("RGBA", size, (0, 0, 0, 0))
-    sd = ImageDraw.Draw(shadow)
-    mbx0, mby0, mbx1, mby1 = mascot_box
-    sd.ellipse([mbx0 + (mbx1 - mbx0) * 0.15, mby1 - h * 0.05,
-                mbx1 - (mbx1 - mbx0) * 0.15, mby1 + h * 0.03], fill=(0, 0, 0, 130))
-    shadow = shadow.filter(ImageFilter.GaussianBlur(14))
-    layer.paste(shadow, (0, 0), shadow)
-    draw = ImageDraw.Draw(layer)
-    fn(layer, draw, mascot_box, is_win)
-    return layer
+    layer, d = _overlay(img)
+    x0, y0, x1, y1 = region
+    for _ in range(count):
+        cx = rnd.uniform(x0, x1)
+        cy = rnd.uniform(y0, y1)
+        size = rnd.uniform(3, 7)
+        angle = rnd.uniform(0, math.pi)
+        dx, dy = math.cos(angle) * size, math.sin(angle) * size
+        color = rnd.choice(colors or CONFETTI_COLORS)
+        alpha = rnd.randint(120, 220)
+        d.line([(cx - dx, cy - dy), (cx + dx, cy + dy)],
+               fill=color + (alpha,), width=int(max(2, size * 0.8)))
+    _composite(img, layer)
 
 
-def _sparkline_right(draw, box, is_win, seed=None):
-    """Simple sparkline on the right panel showing price trend."""
-    rnd = random.Random(seed)
+def _sparkline(img: Image.Image, box, seed, color, final_pct: float):
+    """Price curve ending at the final PnL, with translucent fill under it."""
     x0, y0, x1, y1 = box
-    n = 30
-    pts = []
-    val = 0.5
-    for i in range(n):
-        drift = 0.04 if is_win else -0.03
-        val += drift + rnd.uniform(-0.06, 0.06)
-        val = max(0.02, min(0.98, val))
-        pts.append(val)
-    target = 0.92 if is_win else 0.08
-    for i in range(n - 6, n):
-        w_f = (i - (n - 6)) / 6
-        pts[i] = pts[i] * (1 - w_f) + target * w_f
-    color = GREEN if is_win else RED
-    coords = []
-    for i, v in enumerate(pts):
-        x = x0 + (x1 - x0) * i / (n - 1)
-        y = y1 - (y1 - y0) * v
-        coords.append((x, y))
-    draw.line(coords, fill=color, width=4, joint="curve")
+    rnd = random.Random(seed)
+    n = 40
+    vals, v = [], 0.5
+    for _ in range(n):
+        v += rnd.uniform(-0.05, 0.05)
+        v = max(0.05, min(0.95, v))
+        vals.append(v)
+    end = 0.9 if final_pct >= 0 else 0.12
+    for i in range(n - 8, n):
+        t = (i - (n - 8)) / 8
+        vals[i] = vals[i] * (1 - t) + end * t
+    pts = [(x0 + (x1 - x0) * i / (n - 1),
+            y1 - (y1 - y0) * v) for i, v in enumerate(vals)]
+    fill_layer, fd = _overlay(img)
+    fd.polygon(pts + [(x1, y1), (x0, y1)], fill=color + (25,))
+    _composite(img, fill_layer)
+    line_layer, ld = _overlay(img)
+    ld.line(pts, fill=color + (255,), width=4, joint="curve")
+    _composite(img, line_layer)
 
+
+def _rocket(img: Image.Image, cx, cy, scale: float = 1.0,
+            body=(220, 225, 235), flame=GOLD, window=SOL_BLUE):
+    """Small vector rocket glyph (emoji-free, renders everywhere)."""
+    layer, d = _overlay(img)
+    s = scale
+    d.polygon([(cx, cy - 34 * s), (cx + 14 * s, cy - 6 * s),
+               (cx + 10 * s, cy + 18 * s), (cx - 10 * s, cy + 18 * s),
+               (cx - 14 * s, cy - 6 * s)], fill=body + (255,))
+    d.ellipse([cx - 5 * s, cy - 16 * s, cx + 5 * s, cy - 6 * s],
+              fill=window + (255,))
+    d.polygon([(cx - 14 * s, cy + 2 * s), (cx - 24 * s, cy + 20 * s),
+               (cx - 10 * s, cy + 18 * s)], fill=flame + (255,))
+    d.polygon([(cx + 14 * s, cy + 2 * s), (cx + 24 * s, cy + 20 * s),
+               (cx + 10 * s, cy + 18 * s)], fill=flame + (255,))
+    d.polygon([(cx - 6 * s, cy + 18 * s), (cx + 6 * s, cy + 18 * s),
+               (cx, cy + 34 * s)], fill=flame + (255,))
+    _composite(img, layer)
+
+
+# ── Layout blocks ─────────────────────────────────────────────────────
+
+def _header(img: Image.Image, symbol: str, brand: str = "GEMBOT"):
+    d = ImageDraw.Draw(img)
+    y = 44
+    # Token avatar: colored circle + first letter
+    rnd = random.Random(symbol)
+    avatar_colors = [WIN, SOL_BLUE, GOLD, PURPLE, (255, 122, 69)]
+    ac = rnd.choice(avatar_colors)
+    cx, cy, r = MARGIN + 34, y + 34, 34
+    d.ellipse([cx - r, cy - r, cx + r, cy + r], fill=ac + (255,))
+    letter = symbol[:1].upper()
+    f_av = _font(34)
+    bb = f_av.getbbox(letter)
+    d.text((cx - (bb[2] - bb[0]) / 2 - bb[0], cy - (bb[3] - bb[1]) / 2 - bb[1]),
+           letter, font=f_av, fill=INK + (255,))
+    # Ticker
+    f_tick = _font(38)
+    tick = f"${symbol.upper()}"
+    d.text((MARGIN + 84, y + 12), tick, font=f_tick, fill=VALUE + (255,))
+    # SOL chain badge
+    f_badge = _font(20)
+    bw = f_badge.getbbox("SOL")[2]
+    bx = MARGIN + 84 + f_tick.getbbox(tick)[2] + 18
+    _blend_rect(img, [bx, y + 20, bx + bw + 20, y + 52], 8, SOL_BLUE, 40,
+                outline_color=SOL_BLUE, outline_alpha=180, width=1)
+    d.text((bx + 10, y + 26), "SOL", font=f_badge, fill=SOL_BLUE + (255,))
+    # Brand top-right + rocket mark
+    f_brand = _font(26)
+    tw = f_brand.getbbox(brand)[2]
+    bx2 = W - MARGIN - tw - 56
+    _glow(img, (bx2, y + 18), brand, f_brand, BRAND,
+          glow_radius=8, glow_alpha=110)
+    _text(img, (bx2, y + 18), brand, f_brand, BRAND)
+    _rocket(img, W - MARGIN - 20, y + 34, scale=0.75)
+
+
+def _detail_rows(img: Image.Image, rows: list[tuple[str, str]], y0: int,
+                 color_map: dict[str, tuple] | None = None) -> int:
+    """Label-left / value-right rows. Returns the y after the last row."""
+    d = ImageDraw.Draw(img)
+    f_label = _font(24)
+    f_value = _font(28)
+    y = y0
+    color_map = color_map or {}
+    for i, (label, value) in enumerate(rows):
+        d.text((MARGIN + 8, y), label, font=f_label, fill=LABEL + (255,))
+        vb = f_value.getbbox(value)
+        vw = vb[2] - vb[0]
+        color = color_map.get(label, VALUE)
+        d.text((W - MARGIN - 8 - vw, y - 4), value, font=f_value,
+               fill=color + (255,))
+        y += 52
+        if i < len(rows) - 1:
+            _blend_line(img, (MARGIN + 8, y - 12), (W - MARGIN - 8, y - 12),
+                        VALUE, 14, width=1)
+    return y
+
+
+def _footer(img: Image.Image, handle: str | None):
+    d = ImageDraw.Draw(img)
+    f_foot = _font(22)
+    d.text((MARGIN + 8, H - 52), "t.me/GEMBOT", font=f_foot, fill=BRAND + (255,))
+    if handle:
+        tag = "@" + handle.lstrip("@")
+        tb = f_foot.getbbox(tag)
+        d.text((W - MARGIN - 8 - (tb[2] - tb[0]), H - 52), tag,
+               font=f_foot, fill=LABEL + (255,))
+
+
+# ── Main entry ────────────────────────────────────────────────────────
 
 def generate_pnl_card(
     token_symbol: str,
@@ -258,154 +348,160 @@ def generate_pnl_card(
     wallet: str = None,
     telegram_username: str = None,
     is_win: bool = True,
-    seed: int = None,
+    seed=None,
     logo_bytes: bytes = None,
+    multiplier: float = None,
+    sol_spent: float = None,
+    sol_received: float = None,
+    milestone_mode: bool = False,
 ) -> bytes:
     """
-    Generate a GEMBOT-branded PnL card image (1255x838 PNG bytes).
+    Generate a GEMBOT PnL card (1280x840 PNG bytes).
 
-    Args:
-        token_symbol: Token symbol (e.g. "PEPE")
-        pnl_pct: Percentage gain/loss (e.g. 142.5 for +142.5%)
-        entry_mcap: Market cap at entry/alert time
-        current_mcap: Current market cap
-        peak_mcap: Peak market cap achieved
-        duration: Time held (e.g. "2h 14m")
-        wallet: Wallet address (shortened)
-        telegram_username: @handle shown in footer
-        is_win: True = profit (green), False = loss (red)
-        seed: Random seed for reproducible mascot
-        logo_bytes: PNG bytes of token logo to overlay as watermark
+    Regular/sell card: hero = PnL %, secondary = "Received ◎ X",
+    then sparkline + detail rows + footer.
 
-    Returns:
-        PNG bytes ready to send via Telegram send_photo
+    Milestone card (milestone_mode=True): the multiplier becomes the hero
+    with gold gradient + escalation tiers by size:
+      1.5x-3x badge · 5x+ gold border + rocket · 10x+ GEM CALL ribbon +
+      confetti · 50x+ purple full celebration.
     """
-    accent = GREEN if is_win else RED
+    seed = seed if seed is not None else sum(ord(c) for c in token_symbol)
+    accent = WIN if (is_win and pnl_pct >= 0) else LOSS
 
-    img = Image.new("RGB", (W2, H2), BG_BOTTOM)
-    draw = ImageDraw.Draw(img)
+    img = _background(accent)
+    _header(img, token_symbol)
 
-    # --- Left panel: mascot ---
-    fn = None
-    if is_win:
-        fn = MASCOTS[0]  # bull for win
+    f_hero = _font(120)
+    hero_y = 150
+
+    # ── Milestone escalation tier ────────────────────────────────────
+    tier = 0
+    if milestone_mode and multiplier:
+        if multiplier >= 50:
+            tier = 3
+        elif multiplier >= 10:
+            tier = 2
+        elif multiplier >= 5:
+            tier = 1
+
+    border_color = GOLD if tier >= 1 else accent
+
+    # GEM CALL ribbon (10x+) — blended pill so the label stays legible
+    if tier >= 2:
+        f_rib = _font(24)
+        rib = "GEM CALL"
+        rb = f_rib.getbbox(rib)
+        rw = rb[2] - rb[0]
+        rx = (W - rw - 44) / 2
+        rib_color = PURPLE if tier >= 3 else GOLD
+        _blend_rect(img, [rx, hero_y - 8, rx + rw + 44, hero_y + 34], 17,
+                    rib_color, 36,
+                    outline_color=rib_color, outline_alpha=230, width=2)
+        _text(img, (W / 2, hero_y + 2), rib, f_rib, rib_color, align="center")
+        hero_y += 56
+
+    # ── Hero number (drawn EXACTLY ONCE) ─────────────────────────────
+    if milestone_mode and multiplier and tier >= 1:
+        # THE MULTIPLIER IS THE CARD: ~200px gold gradient + glow
+        f_big = _font(200)
+        txt = _fmt_mult(multiplier)
+        bb = f_big.getbbox(txt)
+        hx, hy = W / 2, hero_y + 10
+        _gradient_text(img, (hx, hy), txt, f_big,
+                       (255, 236, 160), GOLD, glow_color=GOLD)
+        hero_h = bb[3] - bb[1] + 30
+        # PnL% demoted to secondary
+        f_sec = _font(56)
+        sec = f"+{pnl_pct:.0f}%" if pnl_pct >= 0 else f"{pnl_pct:.0f}%"
+        _glow(img, (W / 2, hy + hero_h + 8), sec, f_sec, WIN,
+              glow_radius=10, glow_alpha=90)
+        _text(img, (W / 2, hy + hero_h + 8), sec, f_sec, WIN, align="center")
+        hero_end = hy + hero_h + 8 + 56 + 26
+        _rocket(img, W / 2 + bb[2] / 2 + 60, hy + 90, scale=1.15)
     else:
-        fn = MASCOTS[1]  # bear for loss
-    panel = _mascot_panel((split_x + 40, H2), is_win, seed=seed, mascot=fn)
-    img.paste(panel, (0, 0))
-    draw = ImageDraw.Draw(img)
+        # Regular hero: PnL % (solid draw, single pass)
+        txt = f"{'+' if pnl_pct >= 0 else ''}{pnl_pct:.1f}%"
+        bb = f_hero.getbbox(txt)
+        _glow(img, (W / 2, hero_y), txt, f_hero, accent,
+              glow_radius=22, glow_alpha=150)
+        _text(img, (W / 2, hero_y), txt, f_hero, accent, align="center")
+        hero_end = hero_y + (bb[3] - bb[1]) + 34
+        # small gold multiplier badge (1.5x-3x milestones) — blended, not solid
+        if milestone_mode and multiplier:
+            f_bad = _font(30)
+            bad = _fmt_mult(multiplier)
+            bbb = f_bad.getbbox(bad)
+            bw = bbb[2] - bbb[0]
+            bx = W / 2 + bb[2] / 2 + 24
+            by = hero_y + 6
+            _blend_rect(img, [bx, by, bx + bw + 32, by + 46], 12,
+                        GOLD, 30, outline_color=GOLD, outline_alpha=230, width=2)
+            _text(img, (bx + 16, by + 8), bad, f_bad, GOLD)
 
-    # --- Diagonal divider ---
-    diag_offset = 90
-    draw.polygon(
-        [(split_x, 0), (split_x + diag_offset, 0),
-         (split_x + diag_offset - int(H2 * 0.12), H2), (split_x - int(H2 * 0.12), H2)],
-        fill=CARD,
-    )
-    draw.line([(split_x, 0), (split_x - int(H2 * 0.12), H2)], fill=(230, 230, 235), width=4)
+    # ── Secondary line: SOL received (the flex number) ───────────────
+    y = hero_end
+    f_sub = _font(34)
+    if sol_received is not None:
+        sub = f"Received ◎ {sol_received:.4f}"
+        if sol_spent:
+            sub += f"  (from ◎ {sol_spent:.4f})"
+        sub_color = GOLD if milestone_mode else accent
+        _glow(img, (W / 2, y), sub, f_sub, sub_color,
+              glow_radius=8, glow_alpha=70)
+        _text(img, (W / 2, y), sub, f_sub, sub_color, align="center")
+        y += 34 + 22
+    elif milestone_mode and multiplier and tier == 0:
+        sub = f"+{pnl_pct:.0f}%" if pnl_pct >= 0 else f"{pnl_pct:.0f}%"
+        _text(img, (W / 2, y), sub, f_sub, WIN, align="center")
+        y += 34 + 22
 
-    # --- Right panel content ---
-    panel_x0 = split_x + diag_offset - int(H2 * 0.12) + 40
-    right_edge = W2 - 60
+    # ── Sparkline (skipped on big milestones to keep rows breathing) ─
+    if not (milestone_mode and tier >= 1):
+        _sparkline(img, (MARGIN + 20, y + 6, W - MARGIN - 20, y + 116),
+                   seed, accent, pnl_pct)
+        y += 140
 
-    # GEMBOT brand header
-    f_brand = _font(F_BOLD, 28)
-    brand = "GEMBOT"
-    bw = draw.textlength(brand, font=f_brand)
-    draw.text((right_edge - bw, 30), brand, font=f_brand, fill=GEMBOT_BLUE)
-
-    # Tagline
-    f_tagline = _font(F_REG, 16)
-    tagline = "stay ahead"
-    tw = draw.textlength(tagline, font=f_tagline)
-    draw.text((right_edge - tw, 68), tagline, font=f_tagline, fill=MUTED)
-
-    # Token symbol
-    f_symbol = _font(F_BOLD, 40)
-    sym = f"${token_symbol.upper()}"
-    sw = draw.textlength(sym, font=f_symbol)
-    sym_x = panel_x0 + ((right_edge - panel_x0) - sw) / 2
-    draw.text((sym_x, 170), sym, font=f_symbol, fill=WHITE)
-
-    # Big PnL %
-    f_big = _font(F_BOLD, 72)
-    pct_txt = f"{'+' if is_win else ''}{pnl_pct:.1f}%"
-    pw = draw.textlength(pct_txt, font=f_big)
-    pct_x = panel_x0 + ((right_edge - panel_x0) - pw) / 2
-    draw.text((pct_x, 240), pct_txt, font=f_big, fill=accent)
-
-    # Sparkline
-    spark_box = (panel_x0 + 20, 340, right_edge - 20, 410)
-    _sparkline_right(draw, spark_box, is_win, seed=seed)
-
-    # Stats grid
-    f_label = _font(F_REG, 22)
-    f_value = _font(F_BOLD, 30)
-
-    stats = []
-    if entry_mcap is not None:
-        if entry_mcap >= 1_000_000:
-            entry_str = f"${entry_mcap/1_000_000:.2f}M"
-        elif entry_mcap >= 1_000:
-            entry_str = f"${entry_mcap/1_000:.1f}K"
-        else:
-            entry_str = f"${entry_mcap:.0f}"
-        stats.append(("ENTRY MCAP", entry_str))
-
-    if current_mcap is not None:
-        if current_mcap >= 1_000_000:
-            cur_str = f"${current_mcap/1_000_000:.2f}M"
-        elif current_mcap >= 1_000:
-            cur_str = f"${current_mcap/1_000:.1f}K"
-        else:
-            cur_str = f"${current_mcap:.0f}"
-        stats.append(("CURRENT MCAP", cur_str))
-
-    if peak_mcap is not None:
-        if peak_mcap >= 1_000_000:
-            peak_str = f"${peak_mcap/1_000_000:.2f}M"
-        elif peak_mcap >= 1_000:
-            peak_str = f"${peak_mcap/1_000:.1f}K"
-        else:
-            peak_str = f"${peak_mcap:.0f}"
-        stats.append(("PEAK MCAP", peak_str))
-
-    stat_start_y = 450
-    for i, (label, value) in enumerate(stats):
-        row_y = stat_start_y + i * 70
-        draw.text((panel_x0 + 20, row_y), label, font=f_label, fill=MUTED)
-        draw.text((panel_x0 + 20, row_y + 30), value, font=f_value, fill=WHITE)
-
-    # Duration
+    # ── Detail rows ──────────────────────────────────────────────────
+    rows: list[tuple[str, str]] = []
+    cmap: dict[str, tuple] = {}
+    if multiplier:
+        rows.append(("MULTIPLIER", _fmt_mult(multiplier)))
+        cmap["MULTIPLIER"] = GOLD if milestone_mode else accent
+    if entry_mcap is not None and current_mcap is not None:
+        rows.append(("MCAP JOURNEY", f"{_fmt_mcap(entry_mcap)} → {_fmt_mcap(current_mcap)}"))
+    if sol_spent is not None:
+        rows.append(("SOL SPENT", f"◎ {sol_spent:.4f}"))
+    if sol_received is not None:
+        rows.append(("SOL RECEIVED", f"◎ {sol_received:.4f}"))
+        cmap["SOL RECEIVED"] = GOLD
+    if peak_mcap is not None and not milestone_mode:
+        rows.append(("PEAK MCAP", _fmt_mcap(peak_mcap)))
     if duration:
-        f_dur = _font(F_REG, 22)
-        dur_txt = f"\u23f1  {duration}"
-        draw.text((panel_x0 + 20, H2 - 140), dur_txt, font=f_dur, fill=MUTED)
-
-    # Footer: wallet + telegram handle
-    f_foot = _font(F_MONO, 22)
-    if telegram_username:
-        foot_txt = f"@{telegram_username.lstrip('@')}"
-        draw.text((panel_x0 + 20, H2 - 80), foot_txt, font=_font(F_BOLD, 28), fill=WHITE)
-
+        rows.append(("HELD", duration))
     if wallet:
-        draw.text((panel_x0 + 20, H2 - 48), wallet, font=_font(F_MONO, 20), fill=MUTED)
+        short = wallet if len(wallet) <= 16 else f"{wallet[:6]}…{wallet[-4:]}"
+        rows.append(("WALLET", short))
+    max_rows = max(2, int((H - 92 - y) // 52))
+    rows = rows[:max_rows]
+    if rows:
+        _detail_rows(img, rows, y, cmap)
 
-    # Token watermark
-    if logo_bytes:
-        try:
-            wm = Image.open(io.BytesIO(logo_bytes)).convert("RGBA")
-            wm_size = min(W2, H2) // 3
-            wm = wm.resize((wm_size, wm_size))
-            r, g, b, a = wm.split()
-            a = a.point(lambda x: min(x, 50))
-            wm = Image.merge("RGBA", (r, g, b, a))
-            wx = (W2 - wm_size) // 2
-            wy = (H2 - wm_size) // 2
-            img.paste(wm, (wx, wy), wm)
-        except:
-            pass
+    # ── Confetti tiers ───────────────────────────────────────────────
+    if milestone_mode:
+        if tier >= 3:
+            _confetti(img, seed, 90, (60, 40, W - 60, hero_end + 80),
+                      colors=CONFETTI_COLORS + [PURPLE, GOLD])
+            _confetti(img, seed + 1, 50, (60, hero_end + 80, W - 60, H - 120))
+        elif tier >= 2:
+            _confetti(img, seed, 55, (60, 40, W - 60, hero_end + 60))
+        elif tier >= 1:
+            _confetti(img, seed, 24, (60, 40, W - 60, 340))
 
-    buf = io.BytesIO()
-    img.save(buf, format="PNG")
-    return buf.getvalue()
+    # ── Border + footer last (crisp on top) ──────────────────────────
+    _glow_border(img, border_color)
+    _footer(img, telegram_username)
+
+    out = io.BytesIO()
+    img.convert("RGB").save(out, format="PNG")
+    return out.getvalue()

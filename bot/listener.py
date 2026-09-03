@@ -1,6 +1,6 @@
 """
 Telegram listener — polls for user commands and dispatches them.
-Supports multi-user wallet management (Phase 1).
+Supports multi-user wallet management (Phase 1) + auto-trading (Phase 3).
 
 Commands:
   /start              — Create profile + auto-generate first wallet
@@ -10,6 +10,11 @@ Commands:
   /wallet default <label> — Set default wallet
   /wallet export      — ⚠️ Export private key (use with caution)
   /balance            — Show SOL + token balances
+  /buy <addr> <sol>   — Instant buy via Jupiter
+  /sell <addr> [pct]  — Instant sell + PnL card
+  /slippage <bps>     — Set swap slippage
+  /status <sig>       — Check transaction status
+  /auto [on|off|set]  — Auto-trading on bot calls
 
 Runs in a background daemon thread alongside the main scanner.
 """
@@ -22,16 +27,20 @@ import re
 
 import requests
 
+import base58
+
 from config import TELEGRAM_BOT_TOKEN
 from bot.models import (
     get_or_create_user, get_user_by_telegram_id,
     get_user_wallets, get_default_wallet, create_user_wallet,
     set_default_wallet, get_wallet_by_label,
     save_trade, get_user_trades, get_trade_by_sig, update_trade_status,
+    get_alert_for_token, get_last_buy_trade,
 )
 from bot.wallet import generate_wallet, get_wallet_info, decrypt_private_key
 from bot.jupiter import buy_token, sell_token, get_quote, check_transaction_status, get_token_decimals
 from bot.helius import SOLANA_RPC
+from bot.telegram import send_pnl_card
 
 logger = logging.getLogger(__name__)
 
@@ -266,7 +275,7 @@ def _cmd_balance(chat_id: int, text: str):
 # ── Trading commands (Phase 2) ────────────────────────────────────────
 
 def _cmd_buy(chat_id: int, text: str):
-    """Buy tokens: /buy <token_address> <amount_sol>"""
+    """Buy tokens: /buy <token_address> <amount_sol> — instant swap."""
     user = get_user_by_telegram_id(chat_id)
     if not user:
         _reply(chat_id, "❌ Send /start first to create your profile.")
@@ -293,77 +302,62 @@ def _cmd_buy(chat_id: int, text: str):
         _reply(chat_id, "❌ No wallet found. Use /start to create one.")
         return
 
-    # Get quote first for preview
-    from bot.jupiter import SOL_MINT, LAMPORTS_PER_SOL
+    # Quote for preview + price sanity
+    from bot.jupiter import SOL_MINT, LAMPORTS_PER_SOL, get_token_decimals
     amount_lamports = int(amount_sol * LAMPORTS_PER_SOL)
-    quote = get_quote(SOL_MINT, token_address, amount_lamports)
+    quote = get_quote(SOL_MINT, token_address, amount_lamports,
+                      int(wallet.get("slippage_bps") or 500))
     if not quote:
         _reply(chat_id, "❌ Could not get a quote for this token. Check the address.")
         return
 
     out_amount = int(quote.get("outAmount", 0))
     price_impact = float(quote.get("priceImpactPct", 0))
-    routes = len(quote.get("routePlan", []))
 
-    _reply(chat_id,
-        f"📊 <b>Buy Preview</b>\n\n"
-        f"Spend: ◎ {amount_sol:.4f} SOL\n"
-        f"Expected: {out_amount:,} tokens\n"
-        f"Price impact: {price_impact:.2f}%\n"
-        f"Routes: {routes}\n"
-        f"Slippage: {wallet.get('slippage_bps', 500) / 100:.1f}%\n\n"
-        f"To confirm, send:\n"
-        f"<code>/buy confirm {token_address[:8]}...</code>"
-    )
-
-
-def _cmd_buy_confirm(chat_id: int, text: str):
-    """Confirm and execute buy: /buy confirm <partial_token_address>"""
-    user = get_user_by_telegram_id(chat_id)
-    if not user:
-        _reply(chat_id, "❌ Send /start first.")
-        return
-    parts = text.strip().split()
-    if len(parts) < 3:
-        _reply(chat_id, "❌ Usage: /buy confirm &lt;token_address_prefix&gt;")
+    if price_impact > 15:
+        _reply(chat_id,
+               f"❌ Price impact too high: {price_impact:.1f}% — trade aborted.")
         return
 
-    wallet = get_default_wallet(user["id"], include_privkey=True)
-    if not wallet:
-        _reply(chat_id, "❌ No wallet.")
-        return
-
-    # Get the last buy command context from user_data isn't available in polling mode
-    # So we execute with what we have - the address prefix
-    _reply(chat_id, "⏳ Executing swap... This may take a few seconds.")
+    _reply(chat_id, "⏳ Executing instant buy...")
     try:
         raw_key = decrypt_private_key(wallet["encrypted_private_key"])
         sig = buy_token(
-            token_address=parts[2],  # will need full address
-            amount_sol=0.01,  # placeholder - need to store amount
+            token_address=token_address,
+            amount_sol=amount_sol,
             user_pubkey=wallet["public_key"],
             keypair_bytes=raw_key,
+            slippage_bps=int(wallet.get("slippage_bps") or 500),
         )
-        if sig:
-            # Look up token symbol
-            from bot.models import execute, commit, close_cursor, _dict_rows
-            c = execute("SELECT token_symbol FROM trades WHERE user_id = %s ORDER BY id DESC LIMIT 1",
-                        (user["id"],))
-            row = c.fetchone()
-            symbol = row[0] if row else parts[2][:8]
-            close_cursor(c)
-
-            _reply(chat_id,
-                f"✅ <b>Buy Executed!</b>\n\n"
-                f"Token: ${symbol}\n"
-                f"Tx: <code>{sig[:16]}...</code>\n\n"
-                f"🔗 <a href='https://solscan.io/tx/{sig}'>View on Solscan</a>"
-            )
-        else:
-            _reply(chat_id, "❌ Swap failed. Check token address and try again.")
     except Exception as e:
         logger.error("Buy failed for user %s: %s", chat_id, e)
-        _reply(chat_id, "❌ Swap failed. Please try again later.")
+        sig = None
+
+    if not sig:
+        _reply(chat_id, "❌ Swap failed. Check token address and try again.")
+        return
+
+    # Record the trade so /sell can compute PnL
+    alert = get_alert_for_token(token_address)
+    symbol = alert["symbol"] if alert else token_address[:8]
+    decimals = get_token_decimals(token_address)
+    amount_token = out_amount / (10 ** decimals) if out_amount else None
+    entry_price_sol = None
+    if out_amount:
+        entry_price_sol = (amount_lamports / LAMPORTS_PER_SOL) / (out_amount / (10 ** decimals))
+    save_trade(user["id"], wallet["id"], "buy", token_address, token_symbol=symbol,
+               amount_sol=amount_sol, amount_token=amount_token,
+               price_sol=entry_price_sol, tx_signature=sig,
+               slippage_bps=int(wallet.get("slippage_bps") or 500))
+
+    _reply(chat_id,
+        f"✅ <b>Buy Executed!</b>\n\n"
+        f"Token: ${html.escape(symbol)}\n"
+        f"Spent: ◎ {amount_sol:.4f}\n"
+        f"Received: {out_amount:,} raw units\n"
+        f"Tx: <code>{sig[:16]}...</code>\n\n"
+        f"🔗 <a href='https://solscan.io/tx/{sig}'>View on Solscan</a>"
+    )
 
 
 def _cmd_sell(chat_id: int, text: str):
@@ -414,6 +408,7 @@ def _cmd_sell(chat_id: int, text: str):
 
     _reply(chat_id, f"⏳ Selling {pct}% of token...")
 
+    slippage_bps = int(wallet.get("slippage_bps") or 500)
     try:
         raw_key = decrypt_private_key(wallet["encrypted_private_key"])
         sig = sell_token(
@@ -421,19 +416,67 @@ def _cmd_sell(chat_id: int, text: str):
             amount_tokens=amount,
             user_pubkey=wallet["public_key"],
             keypair_bytes=raw_key,
+            slippage_bps=slippage_bps,
         )
-        if sig:
-            _reply(chat_id,
-                f"✅ <b>Sell Executed!</b>\n\n"
-                f"Sold: {pct}%\n"
-                f"Tx: <code>{sig[:16]}...</code>\n\n"
-                f"🔗 <a href='https://solscan.io/tx/{sig}'>View on Solscan</a>"
-            )
-        else:
-            _reply(chat_id, "❌ Sell failed.")
     except Exception as e:
         logger.error("Sell failed for user %s: %s", chat_id, e)
+        sig = None
+
+    if not sig:
         _reply(chat_id, "❌ Sell failed.")
+        return
+
+    save_trade(user["id"], wallet["id"], "sell", token_address,
+               token_symbol=token_info.get("symbol"),
+               amount_token=token_info["amount"], tx_signature=sig,
+               slippage_bps=slippage_bps)
+
+    _reply(chat_id,
+        f"✅ <b>Sell Executed!</b>\n\n"
+        f"Sold: {pct}%\n"
+        f"Tx: <code>{sig[:16]}...</code>\n\n"
+        f"🔗 <a href='https://solscan.io/tx/{sig}'>View on Solscan</a>"
+    )
+
+    # ── PnL card: entry from last recorded buy, exit from this tx ────
+    try:
+        from bot.auto_trader import _fetch_sol_received
+        from bot.tracker import _fetch_current_mcap
+        sol_received = _fetch_sol_received(sig)
+        buy = get_last_buy_trade(user["id"], token_address)
+        entry_price_sol = buy.get("price_sol") if buy else None
+        pnl = None
+        if entry_price_sol:
+            from bot.jupiter import SOL_MINT, get_quote
+            exit_quote = get_quote(token_address, SOL_MINT, max(1, amount // 1000),
+                                   slippage_bps)
+            if exit_quote:
+                exit_price_sol = (int(exit_quote.get("outAmount", 0)) / 1e9) \
+                    / max(1, (amount / (10 ** token_info["decimals"])) / 1000)
+                pnl = (exit_price_sol / entry_price_sol - 1) * 100
+        alert = get_alert_for_token(token_address)
+        if pnl is None and alert and alert.get("alert_mcap"):
+            current_mcap = _fetch_current_mcap(token_address)
+            if current_mcap:
+                pnl = (current_mcap / alert["alert_mcap"] - 1) * 100
+        if pnl is not None:
+            multiplier = (alert["alert_mcap"] and _fetch_current_mcap(token_address)
+                          and _fetch_current_mcap(token_address) / alert["alert_mcap"]) \
+                          if alert else None
+            send_pnl_card(
+                symbol=token_info.get("symbol") or token_address[:8],
+                pnl_pct=pnl,
+                entry_mcap=alert["alert_mcap"] if alert else None,
+                current_mcap=_fetch_current_mcap(token_address),
+                duration=None,
+                wallet=_short_pubkey(wallet["public_key"]),
+                caption_title=f"💰 SOLD — {pnl:+.1f}%",
+                multiplier=multiplier,
+                sol_spent=buy.get("amount_sol") if buy else None,
+                sol_received=sol_received,
+            )
+    except Exception as e:
+        logger.error("Sell PnL card failed: %s", e)
 
 
 def _cmd_slippage(chat_id: int, text: str):
@@ -489,16 +532,127 @@ def _cmd_status(chat_id: int, text: str):
         _reply(chat_id, "⏳ Transaction still pending...")
 
 
+# ── Auto-trading commands (Phase 3) ───────────────────────────────────
+
+def _cmd_auto(chat_id: int, text: str):
+    """Auto-trading: /auto — show status, /auto on|off, /auto set <key> <value>."""
+    user = get_user_by_telegram_id(chat_id)
+    if not user:
+        _reply(chat_id, "❌ Send /start first to create your profile.")
+        return
+    wallet = get_default_wallet(user["id"])
+    if not wallet:
+        _reply(chat_id, "❌ No wallet found. Use /start to create one.")
+        return
+
+    from bot.models import get_auto_trade_config, upsert_auto_trade_config
+
+    parts = text.strip().split()
+    cfg = get_auto_trade_config(user["id"], wallet["id"])
+
+    # /auto — show current config + open positions
+    if len(parts) == 1:
+        from bot.models import get_open_positions
+        positions = [p for p in get_open_positions()
+                     if p["user_id"] == user["id"] and p["wallet_id"] == wallet["id"]]
+        lines = ["🤖 <b>Auto-Trading</b>"]
+        if cfg and cfg["is_enabled"]:
+            lines.append("Status: ✅ <b>ON</b>")
+        else:
+            lines.append("Status: ⭕ OFF")
+        lines.append("")
+        lines.append(f"Buy amount: ◎ {cfg['buy_amount_sol'] if cfg else 0.1:.4f}")
+        lines.append(f"Max positions: {cfg['max_positions'] if cfg else 3}")
+        lines.append(f"Take profit: +{cfg['take_profit_pct'] if cfg else 100:.0f}%")
+        lines.append(f"Stop loss: -{cfg['stop_loss_pct'] if cfg else 50:.0f}%")
+        lines.append(f"Cooldown: {cfg['cooldown_minutes'] if cfg else 0}m")
+        lines.append("")
+        lines.append(f"Open positions: {len(positions)}")
+        for p in positions[:5]:
+            pnl = p.get("pnl_pct")
+            lines.append(f"  • ${p.get('token_symbol') or p['token_address'][:6]}"
+                         f" — ◎{p.get('amount_sol_invested') or 0:.4f} in")
+        lines.append("")
+        lines.append("<b>Commands:</b>")
+        lines.append("<code>/auto on</code> — enable")
+        lines.append("<code>/auto off</code> — disable")
+        lines.append("<code>/auto set amount 0.25</code> — SOL per buy")
+        lines.append("<code>/auto set maxpos 5</code>")
+        lines.append("<code>/auto set tp 200</code> — take profit %")
+        lines.append("<code>/auto set sl 40</code> — stop loss %")
+        lines.append("<code>/auto set cooldown 30</code> — minutes")
+        _reply(chat_id, "\n".join(lines))
+        return
+
+    sub = parts[1].lower()
+
+    if sub == "on":
+        cfg = upsert_auto_trade_config(user["id"], wallet["id"],
+                                       {"is_enabled": True})
+        _reply(chat_id,
+               "✅ <b>Auto-trading ON</b>\n\n"
+               f"Buy: ◎ {cfg['buy_amount_sol']:.4f} per call\n"
+               f"TP +{cfg['take_profit_pct']:.0f}% / SL -{cfg['stop_loss_pct']:.0f}%\n"
+               f"Max {cfg['max_positions']} positions, {cfg['cooldown_minutes']}m cooldown\n\n"
+               "⚡ Instant-buy fires on every bot call.\n"
+               "Sell cards + milestone cards will follow.")
+        return
+
+    if sub == "off":
+        upsert_auto_trade_config(user["id"], wallet["id"], {"is_enabled": False})
+        _reply(chat_id, "⭕ <b>Auto-trading OFF</b>\n\nOpen positions are still "
+                       "monitored for TP/SL until you /sell them.")
+        return
+
+    if sub == "set":
+        if len(parts) < 4:
+            _reply(chat_id,
+                   "❌ Usage: /auto set &lt;key&gt; &lt;value&gt;\n"
+                   "Keys: amount, maxpos, tp, sl, cooldown")
+            return
+        key, value = parts[2].lower(), parts[3]
+        mapping = {
+            "amount": ("buy_amount_sol", 0.001, 10.0),
+            "maxpos": ("max_positions", 1, 20),
+            "tp": ("take_profit_pct", 10, 10000),
+            "sl": ("stop_loss_pct", 1, 99),
+            "cooldown": ("cooldown_minutes", 0, 1440),
+        }
+        if key not in mapping:
+            _reply(chat_id, "❌ Unknown key. Use: amount, maxpos, tp, sl, cooldown")
+            return
+        col, lo, hi = mapping[key]
+        try:
+            num = float(value)
+        except ValueError:
+            _reply(chat_id, "❌ Value must be a number.")
+            return
+        if not (lo <= num <= hi):
+            _reply(chat_id, f"❌ Value must be between {lo:g} and {hi:g}.")
+            return
+        cfg = upsert_auto_trade_config(user["id"], wallet["id"], {col: num})
+        label = {"amount": "Buy amount", "maxpos": "Max positions",
+                 "tp": "Take profit", "sl": "Stop loss",
+                 "cooldown": "Cooldown"}[key]
+        shown = f"◎ {num:g}" if key == "amount" else f"{num:g}"
+        _reply(chat_id, f"✅ {label} set to {shown}")
+        return
+
+    _reply(chat_id, "❌ Unknown subcommand. Try /auto, /auto on, /auto off, "
+                    "/auto set &lt;key&gt; &lt;value&gt;")
+
+
 # ── Command router ────────────────────────────────────────────────────
 
 _COMMANDS = {
     "/start": _cmd_start,
     "/wallet": _cmd_wallet,
     "/balance": _cmd_balance,
-    "/buy": _cmd_buy_confirm,
+    "/buy": _cmd_buy,
     "/sell": _cmd_sell,
     "/slippage": _cmd_slippage,
     "/status": _cmd_status,
+    "/auto": _cmd_auto,
 }
 
 
@@ -513,7 +667,7 @@ def _route(chat_id: int, text: str):
     else:
         _reply(chat_id,
             "❌ Unknown command.\n\n"
-            "Available: /start, /wallet, /wallet new &lt;label&gt;, /wallet list, /wallet default &lt;label&gt;, /wallet export confirm, /balance, /buy, /sell, /slippage, /status"
+            "Available: /start, /wallet, /balance, /buy, /sell, /slippage, /status, /auto"
         )
 
 

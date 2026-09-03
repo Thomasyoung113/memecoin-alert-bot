@@ -11,7 +11,8 @@ import requests
 from solders.keypair import Keypair
 import base58
 
-from config import HELIUS_RPC, SOLANA_RPC, WALLET_ENCRYPTION_KEY
+from config import WALLET_ENCRYPTION_KEY
+from bot import helius
 
 logger = logging.getLogger(__name__)
 
@@ -70,7 +71,7 @@ def generate_wallet() -> tuple[str, str, bytes]:
 
 def _rpc_call(method: str, params: list) -> dict | None:
     """Make a JSON-RPC call to Solana."""
-    url = HELIUS_RPC or SOLANA_RPC
+    url = helius.HELIUS_RPC or helius.SOLANA_RPC
     payload = {
         "jsonrpc": "2.0",
         "id": 1,
