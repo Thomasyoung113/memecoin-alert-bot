@@ -65,15 +65,19 @@ def _check_rate_limit(chat_id: str, max_per_minute: int = 5) -> bool:
 
 # ── Helpers ───────────────────────────────────────────────────────────
 
-def _reply(chat_id: int, text: str, parse_mode: str = "HTML"):
+def _reply(chat_id: int, text: str, parse_mode: str = "HTML",
+           reply_markup: dict = None):
     """Send a reply message to a chat."""
     try:
-        requests.post(f"{_API}/sendMessage", json={
+        payload = {
             "chat_id": chat_id,
             "text": text,
             "parse_mode": parse_mode,
             "disable_web_page_preview": False,
-        }, timeout=10)
+        }
+        if reply_markup:
+            payload["reply_markup"] = reply_markup
+        requests.post(f"{_API}/sendMessage", json=payload, timeout=10)
     except requests.RequestException as e:
         logger.debug("Failed to reply to %s: %s", chat_id, e)
 
@@ -98,39 +102,58 @@ def _fmt_sol(lamports_or_sol: float, is_lamports: bool = False) -> str:
 # ── Command handlers ──────────────────────────────────────────────────
 
 def _cmd_start(chat_id: int, text: str):
-    """Create user profile + first wallet."""
-    # Get the sender's telegram_id from the message context isn't available here
-    # We use chat_id as telegram_id (works for DMs)
+    """Join gate → create user + first wallet → trial."""
+    from bot import billing
+    from bot.models import ensure_subscription, get_subscription
+
+    # ── Join gate: must be a member of the gate channel ──────────────
+    if not billing.is_channel_member(chat_id):
+        _reply(chat_id, billing.join_gate_message(),
+               reply_markup=billing.join_gate_markup())
+        return
+
     user = get_or_create_user(chat_id)
     wallets = get_user_wallets(user["id"])
     if not wallets:
         try:
             pubkey, encrypted, _ = generate_wallet()
             wallet = create_user_wallet(user["id"], "main", pubkey, encrypted)
-            _reply(chat_id,
-                "🚀 <b>Welcome to GEMBOT!</b>\n\n"
-                "✅ Your Solana wallet has been created:\n"
-                f"<code>{pubkey}</code>\n\n"
-                "📋 <b>Available commands:</b>\n"
-                "  /wallet — View wallet info\n"
-                "  /wallet new &lt;label&gt; — Create another wallet\n"
-                "  /wallet list — List all wallets\n"
-                "  /wallet default &lt;label&gt; — Set default\n"
-                "  /wallet export — ⚠️ Export private key\n"
-                "  /balance — Check SOL + token balances\n\n"
-                "💡 Fund your wallet with SOL to start trading.\n"
-                "Stay ahead. 🐋"
-            )
         except RuntimeError as e:
-            _reply(chat_id, f"❌ {e}")
+            _reply(chat_id, f"❌ {html.escape(str(e))}")
+            return
+        # Start the 3-day full-access trial on first entry
+        sub = billing.start_trial(user["id"])
+        from bot.billing import subscription_status_line
+        _reply(chat_id,
+            "🚀 <b>Welcome to GEMBOT!</b>\n\n"
+            f"✅ Your Solana wallet:\n<code>{pubkey}</code>\n\n"
+            f"{subscription_status_line(user['id'])}\n"
+            "⚡ For your trial you get EVERY call in real time + 24/7 auto-trading.\n\n"
+            "🤖 <b>Quick start:</b>\n"
+            "  /auto — arm auto-trading (amount, TP/SL)\n"
+            "  /positions — track open trades\n"
+            "  /wallet — wallet info · /balance — balances\n\n"
+            f"💎 After the trial: <b>0.2 SOL/week · 0.5 SOL/month</b>\n"
+            "Free tier keeps 1 top call/week + your wallet.\n"
+            "🎟 Promo codes drop daily on @thomas_young",
+            reply_markup={"inline_keyboard": [
+                [{"text": "🤖 Arm Auto-Trading", "callback_data": "auto:menu"}],
+                [{"text": "💎 Go Pro", "callback_data": "sub:menu"}],
+            ]})
     else:
         default = get_default_wallet(user["id"])
         addr = _short_pubkey(default["public_key"]) if default else "?"
+        from bot.billing import subscription_status_line
+        ensure_subscription(user["id"])
         _reply(chat_id,
             "👋 <b>Welcome back!</b>\n\n"
-            f"Default wallet: {addr}\n\n"
-            "Use /wallet to see details or /balance for balances."
-        )
+            f"Default wallet: {addr}\n"
+            f"{subscription_status_line(user['id'])}\n\n"
+            "Use /positions, /auto or /balance.",
+            reply_markup={"inline_keyboard": [
+                [{"text": "📊 Positions", "callback_data": "pos:list"},
+                 {"text": "💎 Go Pro", "callback_data": "sub:menu"}],
+            ]})
 
 
 def _cmd_wallet(chat_id: int, text: str):
@@ -275,7 +298,9 @@ def _cmd_balance(chat_id: int, text: str):
 # ── Trading commands (Phase 2) ────────────────────────────────────────
 
 def _cmd_buy(chat_id: int, text: str):
-    """Buy tokens: /buy <token_address> <amount_sol> — instant swap."""
+    """Buy tokens: /buy <token_address> <amount_sol> — instant swap. Pro only."""
+    if not _require_pro(chat_id):
+        return
     user = get_user_by_telegram_id(chat_id)
     if not user:
         _reply(chat_id, "❌ Send /start first to create your profile.")
@@ -587,6 +612,8 @@ def _cmd_auto(chat_id: int, text: str):
     sub = parts[1].lower()
 
     if sub == "on":
+        if not _require_pro(chat_id):
+            return
         cfg = upsert_auto_trade_config(user["id"], wallet["id"],
                                        {"is_enabled": True})
         _reply(chat_id,
@@ -605,6 +632,8 @@ def _cmd_auto(chat_id: int, text: str):
         return
 
     if sub == "set":
+        if not _require_pro(chat_id):
+            return
         if len(parts) < 4:
             _reply(chat_id,
                    "❌ Usage: /auto set &lt;key&gt; &lt;value&gt;\n"
@@ -642,6 +671,227 @@ def _cmd_auto(chat_id: int, text: str):
                     "/auto set &lt;key&gt; &lt;value&gt;")
 
 
+# ── Subscription commands (Phase 4) ──────────────────────────────────
+
+def _require_pro(chat_id: int) -> bool:
+    """Gate for buy actions. Replies with the paywall if not Pro. Sells must
+    never call this."""
+    from bot.billing import subscription_status_line
+    from bot.models import get_user_by_telegram_id, is_pro
+    user = get_user_by_telegram_id(chat_id)
+    if user and is_pro(user["id"]):
+        return True
+    _reply(chat_id,
+        "🔒 <b>Pro feature</b>\n\n"
+        f"{subscription_status_line(chat_id) if user else 'Send /start first'}\n\n"
+        "💎 <b>0.2 SOL/week · 0.5 SOL/month</b>\n"
+        "✅ Every call, real time · 🤖 24/7 auto-trading\n"
+        "🎟 Promo codes drop daily on @thomas_young",
+        reply_markup={"inline_keyboard": [
+            [{"text": "💎 Pay 0.2 SOL — Week", "callback_data": "sub:sol_week"},
+             {"text": "💎 Pay 0.5 SOL — Month", "callback_data": "sub:sol_month"}],
+            [{"text": "⭐ Pay with Stars", "callback_data": "sub:stars_menu"}],
+            [{"text": "🎟 I have a promo code", "callback_data": "promo:ask"}],
+        ]})
+    return False
+
+
+def _subscribe_screen(chat_id: int):
+    from bot import billing
+    from bot.models import get_user_by_telegram_id
+    user = get_user_by_telegram_id(chat_id)
+    status = billing.subscription_status_line(user["id"]) if user else "Send /start first"
+    _reply(chat_id,
+        f"💎 <b>GEMBOT PRO</b>\n{status}\n\n"
+        "⚡ Every call, real time\n"
+        "🤖 Auto-trading 24/7 (your keys, your funds)\n"
+        "🐋 Whale + insider alerts\n"
+        "🏅 Milestone cards on every run\n\n"
+        "<b>0.2 SOL / week &nbsp;·&nbsp; 0.5 SOL / month</b>",
+        reply_markup={"inline_keyboard": [
+            [{"text": "💎 Week — 0.2 SOL", "callback_data": "sub:sol_week"},
+             {"text": "💎 Month — 0.5 SOL", "callback_data": "sub:sol_month"}],
+            [{"text": "⭐ Pay with Telegram Stars", "callback_data": "sub:stars_menu"}],
+            [{"text": "🎟 Promo code", "callback_data": "promo:ask"}],
+        ]})
+
+
+def _cmd_subscribe(chat_id: int, text: str):
+    _subscribe_screen(chat_id)
+
+
+def _cmd_promo(chat_id: int, text: str):
+    from bot import billing
+    parts = text.strip().split()
+    if len(parts) < 2:
+        _reply(chat_id,
+            "🎟 <b>Promo code</b>\n\n"
+            "Usage: <code>/promo GEM-XXXXXXXXXX</code>\n"
+            "Codes drop daily on @thomas_young — first come, first served.\n"
+            "⚠️ 3 attempts per day.",
+            reply_markup={"inline_keyboard": [
+                [{"text": "🎟 Enter code", "callback_data": "promo:ask"}]]})
+        return
+    if not billing.promo_allowed(chat_id):
+        _reply(chat_id, "🛑 Too many attempts today (3 max). Try again tomorrow.")
+        return
+    ok, msg = billing.redeem(parts[1], chat_id)
+    if ok:
+        _reply(chat_id, f"🎉 <b>{msg}</b>\n\n/auto on to arm the bot.",
+               reply_markup={"inline_keyboard": [
+                   [{"text": "🤖 Arm Auto-Trading", "callback_data": "auto:menu"}]]})
+    else:
+        _reply(chat_id, f"❌ {html.escape(msg)}")
+
+
+def _positions_screen(chat_id: int):
+    """Open positions with live-ish PnL + sell buttons."""
+    from bot.models import (
+        get_user_by_telegram_id, get_open_positions, get_auto_trade_config,
+        execute, close_cursor, _scalar,
+    )
+    from bot.tracker import _fetch_current_mcap
+    user = get_user_by_telegram_id(chat_id)
+    if not user:
+        _reply(chat_id, "❌ Send /start first.")
+        return
+    c = execute("""
+        SELECT p.* FROM positions p
+        JOIN user_wallets w ON w.id = p.wallet_id
+        WHERE p.user_id = %s AND p.status = 'open'
+        ORDER BY p.created_at DESC LIMIT 10
+    """, (user["id"],))
+    positions = _dict_rows(c)
+    close_cursor(c)
+    if not positions:
+        _reply(chat_id,
+               "📭 <b>No open positions.</b>\n\n"
+               "Arm /auto to catch the next call, or /buy manually.")
+        return
+    lines = ["📊 <b>Open positions</b>\n"]
+    buttons = []
+    for p in positions:
+        entry = p.get("entry_mcap") or 0
+        cur = _fetch_current_mcap(p["token_address"]) or 0
+        pnl = ((cur / entry) - 1) * 100 if entry else 0
+        sym = p.get("token_symbol") or p["token_address"][:6]
+        icon = "🟢" if pnl >= 0 else "🔴"
+        lines.append(
+            f"{icon} <b>${html.escape(sym)}</b> — ◎{p.get('amount_sol_invested') or 0:.3f} in · {pnl:+.0f}%")
+        buttons.append([
+            {"text": f"Sell 50% ${sym}", "callback_data": f"sell:{p['token_address']}:50"},
+            {"text": f"Sell 100%", "callback_data": f"sell:{p['token_address']}:100"},
+        ])
+    _reply(chat_id, "\n".join(lines), reply_markup={"inline_keyboard": buttons})
+
+
+def _cmd_positions(chat_id: int, text: str):
+    _positions_screen(chat_id)
+
+
+# ── Callback router (inline buttons) ─────────────────────────────────
+
+def _handle_callback(cb: dict):
+    """Route inline-button presses. Always answers the callback."""
+    from bot import billing
+    from bot.models import get_user_by_telegram_id
+    data = cb.get("data", "")
+    cb_id = cb.get("id")
+    chat_id = (cb.get("message") or {}).get("chat", {}).get("id")
+
+    def ack(text: str = None, alert: bool = False):
+        if cb_id:
+            payload = {"callback_query_id": cb_id}
+            if text:
+                payload["text"] = text
+                payload["show_alert"] = alert
+            billing._tg("answerCallbackQuery", payload)
+
+    if chat_id is None:
+        return
+
+    if data == "gate:check":
+        # bypass cache: fresh getChatMember for this check
+        with billing._member_cache_lock:
+            billing._member_cache.pop(chat_id, None)
+        if billing.is_channel_member(chat_id):
+            ack("✅ Verified!")
+            _cmd_start(chat_id, "/start")
+        else:
+            ack("❌ Not detected yet — join, then tap again.", alert=True)
+        return
+
+    if data == "sub:menu":
+        ack()
+        _subscribe_screen(chat_id)
+        return
+
+    if data.startswith("sub:sol_"):
+        plan = data.split("_", 1)[1]
+        ack("⏳ Generating your deposit address...")
+        inv = billing.create_invoice(get_user_id(chat_id), plan)
+        if inv:
+            _reply(chat_id,
+                "💳 <b>SOL invoice</b>\n\n"
+                f"Send <b>◎ {inv['amount']}</b> to:\n<code>{inv['address']}</code>\n\n"
+                f"⏱ Expires in {inv['ttl_minutes']} min.\n"
+                "Pro activates automatically after 1 confirmation.",
+                reply_markup={"inline_keyboard": [[
+                    {"text": "🔄 Check status", "callback_data": f"sub:check_{inv['invoice_id']}_{plan}"}]]})
+        else:
+            _reply(chat_id, "❌ Could not create invoice. Try again shortly.")
+        return
+
+    if data == "sub:stars_menu":
+        ack()
+        _reply(chat_id, "⭐ <b>Pay with Telegram Stars</b>",
+               reply_markup={"inline_keyboard": [
+                   [{"text": f"⭐ Week — {billing.STARS_PLANS['week']['stars']} stars",
+                     "callback_data": "sub:stars_week"}],
+                   [{"text": f"⭐ Month — {billing.STARS_PLANS['month']['stars']} stars",
+                     "callback_data": "sub:stars_month"}]]})
+        return
+
+    if data.startswith("sub:stars_"):
+        plan = data.rsplit("_", 1)[1]
+        ack("🧾 Opening payment...")
+        billing.send_stars_invoice(chat_id, plan)
+        return
+
+    if data == "promo:ask":
+        ack()
+        _reply(chat_id,
+               "🎟 <b>Enter your code</b>\n\n"
+               "Send: <code>/promo GEM-XXXXXXXXXX</code>\n"
+               "Codes drop daily on @thomas_young")
+        return
+
+    if data == "auto:menu":
+        ack()
+        _cmd_auto(chat_id, "/auto")
+        return
+
+    if data == "pos:list":
+        ack()
+        _positions_screen(chat_id)
+        return
+
+    if data.startswith("sell:"):
+        _, addr, pct = data.split(":")
+        ack("⏳ Selling...")
+        _cmd_sell(chat_id, f"/sell {addr} {pct}")
+        return
+
+    ack()
+
+
+def get_user_id(chat_id):
+    """user_id (DB) for a telegram chat_id, or None."""
+    from bot.models import get_user_by_telegram_id
+    u = get_user_by_telegram_id(chat_id)
+    return u["id"] if u else None
+
+
 # ── Command router ────────────────────────────────────────────────────
 
 _COMMANDS = {
@@ -653,6 +903,9 @@ _COMMANDS = {
     "/slippage": _cmd_slippage,
     "/status": _cmd_status,
     "/auto": _cmd_auto,
+    "/subscribe": _cmd_subscribe,
+    "/promo": _cmd_promo,
+    "/positions": _cmd_positions,
 }
 
 
@@ -667,7 +920,8 @@ def _route(chat_id: int, text: str):
     else:
         _reply(chat_id,
             "❌ Unknown command.\n\n"
-            "Available: /start, /wallet, /balance, /buy, /sell, /slippage, /status, /auto"
+            "Available: /start, /wallet, /balance, /buy, /sell, /slippage, "
+            "/status, /auto, /positions, /subscribe, /promo"
         )
 
 
@@ -690,7 +944,8 @@ def _save_offset(offset: int):
 
 
 def listen():
-    """Poll Telegram for messages and route commands."""
+    """Poll Telegram: commands, button presses, Stars payments."""
+    from bot import billing
     _last_update_id = _load_offset()
 
     while True:
@@ -698,8 +953,9 @@ def listen():
             url = f"{_API}/getUpdates"
             params = {
                 "offset": _last_update_id + 1,
-                "timeout": 10,
-                "allowed_updates": ["message"],
+                "timeout": 3,  # short: pre_checkout must be answered <10s
+                "allowed_updates": ["message", "callback_query",
+                                    "pre_checkout_query"],
             }
             resp = requests.get(url, params=params, timeout=15)
             resp.raise_for_status()
@@ -708,22 +964,54 @@ def listen():
             if not data.get("ok"):
                 continue
 
-            for update in data.get("result", []):
+            updates = data.get("result", [])
+            # Answer payment checks FIRST — they die after 10s
+            updates.sort(key=lambda u: 0 if "pre_checkout_query" in u else 1)
+
+            for update in updates:
                 _last_update_id = update["update_id"]
                 _save_offset(_last_update_id)
+
+                # ── Stars: pre-checkout (answer fast!) ───────────────
+                pq = update.get("pre_checkout_query")
+                if pq:
+                    try:
+                        billing.handle_pre_checkout_query(pq)
+                    except Exception:
+                        logger.exception("pre_checkout failed")
+                        billing._tg("answerPreCheckoutQuery", {
+                            "pre_checkout_query_id": pq.get("id"), "ok": False})
+                    continue
+
+                # ── Inline buttons ───────────────────────────────────
+                cb = update.get("callback_query")
+                if cb:
+                    try:
+                        _handle_callback(cb)
+                    except Exception:
+                        logger.exception("callback failed")
+                    continue
+
                 msg = update.get("message", {})
                 chat = msg.get("chat", {})
                 chat_id = chat.get("id")
-                text = msg.get("text", "")
 
+                # ── Stars: successful payment ────────────────────────
+                if msg.get("successful_payment") and chat_id:
+                    try:
+                        billing.handle_successful_payment(chat_id, msg)
+                    except Exception:
+                        logger.exception("payment handling failed")
+                    continue
+
+                text = msg.get("text", "")
                 if not chat_id:
                     continue
 
-                # Rate limit check
+                # Rate limit normal commands (payments already handled above)
                 if not _check_rate_limit(chat_id):
                     continue
 
-                # Route command
                 if text.strip().startswith("/"):
                     _route(chat_id, text.strip())
 

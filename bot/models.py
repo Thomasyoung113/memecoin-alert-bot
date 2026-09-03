@@ -4,7 +4,8 @@ Uses DATABASE_URL from config (set via Railway Postgres addon).
 """
 import json
 import logging
-from datetime import datetime, timezone
+import threading
+from datetime import datetime, timedelta, timezone
 
 import psycopg2
 from config import DATABASE_URL
@@ -12,30 +13,38 @@ from config import DATABASE_URL
 logger = logging.getLogger(__name__)
 
 _conn = None
+_conn_lock = threading.Lock()
 
 
 def get_conn():
     """Get a singleton connection to PostgreSQL (lazy init)."""
     global _conn
-    if _conn is None or _conn.closed:
-        _conn = psycopg2.connect(DATABASE_URL, sslmode="require")
-        _conn.autocommit = False
+    with _conn_lock:
+        if _conn is None or _conn.closed:
+            _conn = psycopg2.connect(DATABASE_URL, sslmode="require")
+            _conn.autocommit = False
     return _conn
 
 
 def execute(sql, params=None):
-    """Convenience: get cursor, execute SQL, return cursor.
-    Caller must close the cursor and commit on write operations."""
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute(sql, params or ())
+    """Thread-safe: get cursor under lock, execute SQL, return cursor.
+
+    The lock is held only while executing (not while the caller fetches)
+    so concurrent threads serialize statement preparation but still fetch
+    from their own cursors. Callers must close the cursor and commit
+    writes via commit() (also serialized)."""
+    with _conn_lock:
+        conn = get_conn()
+        c = conn.cursor()
+        c.execute(sql, params or ())
     return c
 
 
 def commit():
-    """Commit the current transaction."""
-    conn = get_conn()
-    conn.commit()
+    """Commit the current transaction (serialized across threads)."""
+    with _conn_lock:
+        conn = get_conn()
+        conn.commit()
 
 
 def close_cursor(c):
@@ -224,6 +233,75 @@ def init_db():
             exit_reason     TEXT,
             exited_at       TIMESTAMP,
             created_at      TIMESTAMP
+        )
+    """)
+    close_cursor(c)
+
+    # ── Monetization (Phase 4) ────────────────────────────────────
+    c = execute("""
+        CREATE TABLE IF NOT EXISTS subscriptions (
+            id              SERIAL PRIMARY KEY,
+            user_id         INTEGER NOT NULL REFERENCES bot_users(id) ON DELETE CASCADE,
+            tier            TEXT NOT NULL DEFAULT 'free',
+            status          TEXT NOT NULL DEFAULT 'active',
+            source          TEXT DEFAULT 'trial',
+            starts_at       TIMESTAMP,
+            expires_at      TIMESTAMP,
+            grace_until     TIMESTAMP,
+            warned_48h      BOOLEAN DEFAULT FALSE,
+            pro_channel_invite TEXT,
+            created_at      TIMESTAMP,
+            updated_at      TIMESTAMP,
+            UNIQUE(user_id)
+        )
+    """)
+    close_cursor(c)
+
+    c = execute("""
+        CREATE TABLE IF NOT EXISTS payments (
+            id              SERIAL PRIMARY KEY,
+            user_id         INTEGER NOT NULL REFERENCES bot_users(id) ON DELETE CASCADE,
+            subscription_id INTEGER REFERENCES subscriptions(id),
+            provider        TEXT NOT NULL,
+            provider_charge_id TEXT UNIQUE,
+            amount          REAL,
+            currency        TEXT DEFAULT 'SOL',
+            sol_tx_sig      TEXT,
+            promo_code      TEXT,
+            plan            TEXT,
+            status          TEXT DEFAULT 'paid',
+            created_at      TIMESTAMP
+        )
+    """)
+    close_cursor(c)
+
+    c = execute("""
+        CREATE TABLE IF NOT EXISTS promo_codes (
+            id              SERIAL PRIMARY KEY,
+            code            TEXT UNIQUE NOT NULL,
+            duration_days   INTEGER DEFAULT 7,
+            batch_date      DATE,
+            max_uses        INTEGER DEFAULT 1,
+            used_by         BIGINT,
+            used_at         TIMESTAMP,
+            expires_at      TIMESTAMP,
+            created_at      TIMESTAMP
+        )
+    """)
+    close_cursor(c)
+
+    c = execute("""
+        CREATE TABLE IF NOT EXISTS deposit_invoices (
+            id              SERIAL PRIMARY KEY,
+            user_id         INTEGER NOT NULL REFERENCES bot_users(id) ON DELETE CASCADE,
+            plan            TEXT NOT NULL,
+            expected_sol    REAL,
+            receive_address TEXT UNIQUE NOT NULL,
+            encrypted_privkey TEXT NOT NULL,
+            status          TEXT DEFAULT 'awaiting',
+            created_at      TIMESTAMP,
+            expires_at      TIMESTAMP,
+            paid_tx_sig     TEXT
         )
     """)
     close_cursor(c)
@@ -718,3 +796,378 @@ def close_position(position_id, pnl_pct=None, exit_reason=None):
     """, (pnl_pct, exit_reason, now, position_id))
     close_cursor(c)
     commit()
+
+# ── Subscriptions & monetization (Phase 4) ────────────────────────────
+
+def get_subscription(user_id):
+    """Current subscription row for a user, or None."""
+    c = execute("SELECT * FROM subscriptions WHERE user_id = %s", (user_id,))
+    rows = _dict_rows(c)
+    close_cursor(c)
+    return rows[0] if rows else None
+
+
+def ensure_subscription(user_id):
+    """Guarantee a subscription row exists (trial tier, no expiry yet)."""
+    if get_subscription(user_id) is None:
+        now = datetime.now(timezone.utc).isoformat()
+        c = execute("""
+            INSERT INTO subscriptions (user_id, tier, status, source, starts_at,
+                                       created_at, updated_at)
+            VALUES (%s, 'trial', 'active', 'trial', %s, %s, %s)
+            ON CONFLICT (user_id) DO NOTHING
+        """, (user_id, now, now, now))
+        close_cursor(c)
+        commit()
+    return get_subscription(user_id)
+
+
+def activate_subscription(user_id, days, source, plan=None, promo_code=None,
+                          payment_id=None):
+    """Grant/extend Pro access. Trial converts to Pro starting now (or from
+    an existing expiry, so paid time never gets eaten by remaining trial)."""
+    from config import GRACE_HOURS
+    now = datetime.now(timezone.utc)
+    now_s = now.isoformat()
+    ensure_subscription(user_id)
+    sub = get_subscription(user_id)
+    base = sub.get("expires_at") or now
+    if isinstance(base, str):
+        base = datetime.fromisoformat(base)
+    if base.tzinfo is None:
+        base = base.replace(tzinfo=timezone.utc)
+    # paid time extends from max(now, current expiry) but never less than now
+    start = max(base, now)
+    expires = start + timedelta(days=days)
+    grace = expires + timedelta(hours=GRACE_HOURS)
+    c = execute("""
+        UPDATE subscriptions
+        SET tier = 'pro', status = 'active', source = %s,
+            starts_at = %s, expires_at = %s, grace_until = %s,
+            warned_48h = FALSE, updated_at = %s
+        WHERE user_id = %s
+    """, (source, now_s, expires.isoformat(), grace.isoformat(), now_s, user_id))
+    close_cursor(c)
+    commit()
+    if payment_id:
+        c = execute("UPDATE payments SET subscription_id = (SELECT id FROM subscriptions WHERE user_id = %s) WHERE id = %s",
+                    (user_id, payment_id))
+        close_cursor(c)
+        commit()
+    logger.info("Subscription %s: +%.0fd for user %s (until %s)",
+                source, days, user_id, expires.isoformat())
+    return get_subscription(user_id)
+
+
+def _parse_utc(dtval):
+    if isinstance(dtval, datetime):
+        dt = dtval
+    else:
+        dt = datetime.fromisoformat(str(dtval))
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def is_pro(user_id, include_grace=False):
+    """True while tier is pro (or trial) and not past expiry (+ optional grace)."""
+    sub = get_subscription(user_id)
+    if not sub or sub.get("tier") not in ("pro", "trial"):
+        return False
+    if sub.get("status") == "expired":
+        return False
+    expires = sub.get("expires_at")
+    if not expires:
+        return sub.get("status") == "active"
+    expiry = _parse_utc(expires)
+    if include_grace and sub.get("grace_until"):
+        expiry = _parse_utc(sub["grace_until"])
+    return datetime.now(timezone.utc) <= expiry
+
+
+def is_paid_pro(user_id):
+    """True only for paid Pro (excludes trial tier)."""
+    sub = get_subscription(user_id)
+    return bool(sub) and sub.get("tier") == "pro" and is_pro(user_id)
+
+
+def get_expired_in_grace():
+    """Active subs whose expiry passed — flip to grace, return user_ids."""
+    now = datetime.now(timezone.utc).isoformat()
+    c = execute("""
+        SELECT id, user_id, grace_until FROM subscriptions
+        WHERE status = 'active' AND expires_at IS NOT NULL AND expires_at < %s
+    """, (now,))
+    rows = _dict_rows(c)
+    close_cursor(c)
+    out = []
+    for r in rows:
+        c = execute("UPDATE subscriptions SET status = 'grace', updated_at = %s WHERE id = %s",
+                    (now, r["id"]))
+        close_cursor(c)
+        out.append(r)
+    commit()
+    return out
+
+
+def get_grace_expired():
+    """Grace subs past grace_until — flip to expired, return user_ids."""
+    now = datetime.now(timezone.utc).isoformat()
+    c = execute("""
+        SELECT id, user_id FROM subscriptions
+        WHERE status = 'grace' AND grace_until IS NOT NULL AND grace_until < %s
+    """, (now,))
+    rows = _dict_rows(c)
+    close_cursor(c)
+    out = []
+    for r in rows:
+        c = execute("""
+            UPDATE subscriptions
+            SET status = 'expired', tier = 'free', updated_at = %s
+            WHERE id = %s
+        """, (now, r["id"]))
+        close_cursor(c)
+        out.append(r)
+    commit()
+    return out
+
+
+def get_untouched_trial_expiry():
+    """Subs still on trial tier — used by the expiry warning job."""
+    now = datetime.now(timezone.utc).isoformat()
+    c = execute("""
+        SELECT id, user_id, expires_at FROM subscriptions
+        WHERE tier = 'trial' AND status = 'active'
+          AND expires_at IS NOT NULL AND expires_at < %s
+    """, (now,))
+    rows = _dict_rows(c)
+    close_cursor(c)
+    for r in rows:
+        c = execute("""
+            UPDATE subscriptions
+            SET status = 'expired', tier = 'free', updated_at = %s
+            WHERE id = %s
+        """, (now, r["id"]))
+        close_cursor(c)
+    commit()
+    return rows
+
+
+def set_48h_warned(sub_id):
+    c = execute("UPDATE subscriptions SET warned_48h = TRUE WHERE id = %s", (sub_id,))
+    close_cursor(c)
+    commit()
+
+
+def get_telegram_ids_by_tier(tiers, statuses=("active",)):
+    """telegram_ids of users whose subscription tier is in `tiers`."""
+    if not tiers:
+        return []
+    c = execute("""
+        SELECT u.telegram_id FROM subscriptions s
+        JOIN bot_users u ON u.id = s.user_id
+        WHERE s.tier = ANY(%s) AND s.status = ANY(%s)
+    """, (list(tiers), list(statuses)))
+    rows = _dict_rows(c)
+    close_cursor(c)
+    return [r["telegram_id"] for r in rows]
+
+
+def get_telegram_id(user_id):
+    c = execute("SELECT telegram_id FROM bot_users WHERE id = %s", (user_id,))
+    tid = _scalar(c)
+    close_cursor(c)
+    return tid
+
+
+def get_user_id_by_telegram(telegram_id):
+    c = execute("SELECT id FROM bot_users WHERE telegram_id = %s", (telegram_id,))
+    uid = _scalar(c)
+    close_cursor(c)
+    return uid
+
+
+# ── Payments ──────────────────────────────────────────────────────────
+
+def record_payment(user_id, provider, amount, currency="SOL", plan=None,
+                   provider_charge_id=None, sol_tx_sig=None, promo_code=None,
+                   status="paid"):
+    """Insert a payment row; idempotent on provider_charge_id. Returns id."""
+    now = datetime.now(timezone.utc).isoformat()
+    if provider_charge_id:
+        c = execute("SELECT id FROM payments WHERE provider_charge_id = %s",
+                    (provider_charge_id,))
+        existing = _scalar(c)
+        close_cursor(c)
+        if existing:
+            return existing
+    c = execute("""
+        INSERT INTO payments (user_id, provider, provider_charge_id, amount,
+                              currency, sol_tx_sig, promo_code, plan, status, created_at)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        RETURNING id
+    """, (user_id, provider, provider_charge_id, amount, currency,
+          sol_tx_sig, promo_code, plan, status, now))
+    pid = _scalar(c)
+    close_cursor(c)
+    commit()
+    return pid
+
+
+# ── Promo codes ───────────────────────────────────────────────────────
+
+_PROMO_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"  # no 0/O/1/I
+
+
+def create_promo_batch(count, duration_days, batch_date):
+    """Generate `count` single-use codes for a day. Returns the code list."""
+    import secrets
+    from datetime import timedelta
+    now = datetime.now(timezone.utc)
+    # codes die at 23:59:59 UTC on the batch date
+    expires = datetime(now.year, now.month, now.day, 23, 59, 59,
+                       tzinfo=timezone.utc)
+    if now >= expires:  # safety: generation after expiry window
+        expires = (now + timedelta(days=1)).replace(hour=23, minute=59, second=59)
+    codes = []
+    for _ in range(count):
+        code = "GEM-" + "".join(secrets.choice(_PROMO_ALPHABET)
+                                for _ in range(10))
+        c = execute("""
+            INSERT INTO promo_codes (code, duration_days, batch_date, max_uses,
+                                     expires_at, created_at)
+            VALUES (%s, %s, %s, 1, %s, %s)
+            ON CONFLICT (code) DO NOTHING
+        """, (code, duration_days, batch_date, expires.isoformat(), now.isoformat()))
+        close_cursor(c)
+        codes.append(code)
+    commit()
+    return codes
+
+
+def redeem_promo(code, telegram_id):
+    """Atomically claim a code for this user. Returns (ok, message, days)."""
+    from config import PROMO_DURATION_DAYS
+    now = datetime.now(timezone.utc)
+    if get_user_id_by_telegram(telegram_id) is None:
+        return False, "Send /start first.", 0
+    # rate limit: max 3 failed attempts/day handled by caller; here atomic claim
+    c = execute("""
+        UPDATE promo_codes
+        SET used_by = %s, used_at = %s
+        WHERE code = %s AND used_by IS NULL AND expires_at > %s
+        RETURNING id, duration_days
+    """, (telegram_id, now.isoformat(), code.strip().upper(), now.isoformat()))
+    row = c.fetchone()
+    close_cursor(c)
+    commit()
+    if not row:
+        # diagnose why
+        c = execute("SELECT used_by, expires_at FROM promo_codes WHERE code = %s",
+                    (code.strip().upper(),))
+        info = c.fetchone()
+        close_cursor(c)
+        if not info:
+            return False, "That code doesn't exist. Check @thomas_young — codes drop daily.", 0
+        used_by, expires_at = info
+        if used_by is not None:
+            return False, "Too late — someone already claimed that code. ⏱️", 0
+        return False, "That code expired (codes die same day). Watch for the next drop.", 0
+    promo_id, days = row[0], row[1] or PROMO_DURATION_DAYS
+    activate_subscription(get_user_id_by_telegram(telegram_id), days,
+                          source="promo", plan="week", promo_code=code)
+    c = execute("""
+        UPDATE payments SET promo_code = %s, provider = 'promo', currency = 'PROMO'
+        WHERE user_id = %s AND promo_code = %s AND provider = 'promo'
+    """, (code, get_user_id_by_telegram(telegram_id), code))
+    close_cursor(c)
+    record_payment(get_user_id_by_telegram(telegram_id), "promo", 0,
+                   currency="PROMO", plan="week", promo_code=code)
+    return True, f"Pro unlocked for {days} days! 🤖", days
+
+
+def get_today_promo_stats(batch_date):
+    c = execute("""
+        SELECT COUNT(*) AS total,
+               COUNT(*) FILTER (WHERE used_by IS NOT NULL) AS used,
+               COUNT(*) FILTER (WHERE used_by IS NULL AND expires_at > %s) AS live
+        FROM promo_codes WHERE batch_date = %s
+    """, (datetime.now(timezone.utc).isoformat(), batch_date))
+    rows = _dict_rows(c)
+    close_cursor(c)
+    return rows[0] if rows else {"total": 0, "used": 0, "live": 0}
+
+
+# ── Deposit invoices (SOL rail) ───────────────────────────────────────
+
+def create_deposit_invoice(user_id, plan, expected_sol, receive_address,
+                           encrypted_privkey, ttl_minutes):
+    from datetime import timedelta
+    now = datetime.now(timezone.utc)
+    # one active invoice per user: supersede older ones
+    c = execute("""
+        UPDATE deposit_invoices SET status = 'expired'
+        WHERE user_id = %s AND status = 'awaiting'
+    """, (user_id,))
+    close_cursor(c)
+    c = execute("""
+        INSERT INTO deposit_invoices (user_id, plan, expected_sol, receive_address,
+                                      encrypted_privkey, status, created_at, expires_at)
+        VALUES (%s, %s, %s, %s, %s, 'awaiting', %s, %s)
+        RETURNING id
+    """, (user_id, plan, expected_sol, receive_address, encrypted_privkey,
+          now.isoformat(),
+          (now + timedelta(minutes=ttl_minutes)).isoformat()))
+    inv_id = _scalar(c)
+    close_cursor(c)
+    commit()
+    return inv_id
+
+
+def get_pending_invoices():
+    c = execute("""
+        SELECT * FROM deposit_invoices
+        WHERE status = 'awaiting' AND expires_at > %s
+    """, (datetime.now(timezone.utc).isoformat(),))
+    rows = _dict_rows(c)
+    close_cursor(c)
+    return rows
+
+
+def mark_invoice_paid(invoice_id, tx_sig):
+    now = datetime.now(timezone.utc).isoformat()
+    c = execute("""
+        UPDATE deposit_invoices
+        SET status = 'paid', paid_tx_sig = %s
+        WHERE id = %s AND status = 'awaiting'
+        RETURNING user_id, plan
+    """, (tx_sig, invoice_id))
+    row = c.fetchone()
+    close_cursor(c)
+    commit()
+    return row  # (user_id, plan) or None
+
+
+def expire_stale_invoices():
+    now = datetime.now(timezone.utc).isoformat()
+    c = execute("""
+        UPDATE deposit_invoices SET status = 'expired'
+        WHERE status = 'awaiting' AND expires_at <= %s
+        RETURNING user_id
+    """, (now,))
+    rows = _dict_rows(c)
+    close_cursor(c)
+    commit()
+    return rows
+
+
+def kv_get(key):
+    """Tiny KV store (reuses filter_config) for job state like last run dates."""
+    c = execute("SELECT value FROM filter_config WHERE name = %s", (key,))
+    row = c.fetchone()
+    close_cursor(c)
+    return row[0] if row else None
+
+
+def kv_set(key, value):
+    set_filter_config(key, str(value))

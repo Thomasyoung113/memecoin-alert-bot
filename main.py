@@ -27,10 +27,12 @@ from bot.whale_watcher import start_whale_watcher
 from bot.smart_money import get_smart_wallets_for_token, mark_token_success_for_wallets
 from bot.milestones import check_milestones
 from bot.auto_trader import maybe_auto_buy, maybe_auto_sell, check_all_positions
+from bot.billing import start_billing
 from bot.telegram import (
     send_alert, send_resolved, send_learning_update, send_update,
-    send_pnl_card, send_photo, send_milestone_card,
+    send_pnl_card, send_photo, send_milestone_card, send_to_user,
 )
+from bot.models import get_telegram_ids_by_tier
 from dashboard.server import start_dashboard
 
 # ── Logging ───────────────────────────────────────────────────────────
@@ -94,10 +96,11 @@ def main():
                 total_success, total_alerts, success_rate)
 
     # ── Start background threads ──────────────────────────────────
-    start_listener()                       # Telegram /start handler
+    start_listener()                       # Telegram commands + buttons + Stars
     start_wide_scanner()                   # Phase 2: $10M wide net
     start_whale_watcher()                  # Whale wallet monitor
     start_dashboard()                      # Web dashboard on port 8080
+    start_billing()                        # Subs: promos, expiries, invoices
 
     # ── State ─────────────────────────────────────────────────────
     last_outcome_check = 0

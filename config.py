@@ -72,3 +72,28 @@ DASHBOARD_TOKEN = os.getenv("DASHBOARD_TOKEN", "")  # empty string = no auth
 WALLET_ENCRYPTION_KEY = os.getenv("WALLET_ENCRYPTION_KEY", "")
 
 DATABASE_URL = os.getenv("DATABASE_URL", "")
+
+# ── Monetization (Phase 4) ────────────────────────────────────────────
+# Channels: the free funnel requires a join before /start unlocks.
+GATE_CHANNEL_ID = os.getenv("GATE_CHANNEL_ID", "@everyday_aaii")
+PRO_CHANNEL_ID = os.getenv("PRO_CHANNEL_ID", "")   # official Pro channel
+
+TRIAL_HOURS = 72                 # 3-day free trial with full access
+GRACE_HOURS = 48                 # lapse → 48h grace before access cut
+SUB_PRICE_WEEK_SOL = 0.2         # weekly Pro price in SOL
+SUB_PRICE_MONTH_SOL = 0.5        # monthly Pro price in SOL
+SUB_PRICE_WEEK_STARS = 150       # Telegram Stars SKUs (decide exact amount)
+SUB_PRICE_MONTH_STARS = 350
+MIN_SOL_PRICE_RATIO = 0.97       # ≥97% of price auto-activates, below = pro-rata days
+
+PROMO_CODES_PER_DAY = 10         # generated daily, DM'd to the owner
+PROMO_DURATION_DAYS = 7          # each code = 1 free week
+PROMO_CODE_LEN = 10              # chars, secrets-grade alphabet
+PROMO_RATE_LIMIT_PER_DAY = 3     # redemption attempts per user per day
+FREE_TOP_CALL_DAYS = 7           # free tier: 1 top call per week
+SIGNAL_HOUR_UTC = 13             # daily free-tier message hour
+PROMO_GEN_HOUR_UTC = 9           # daily promo batch hour (owner DM)
+
+TREASURY_WALLET_ADDRESS = os.getenv("TREASURY_WALLET_ADDRESS", "")
+INVOICE_TTL_MINUTES = 60         # SOL deposit invoice lifetime
+PAYMENT_CONFIRMATIONS = 1        # confirmations before Pro activates

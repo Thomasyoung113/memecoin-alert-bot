@@ -101,6 +101,7 @@ def maybe_auto_buy(token_address: str, symbol: str, mcap: float,
     Returns a list of dicts:
       {"symbol", "amount_sol", "tx_sig", "user_id", "wallet_id", "position_id"}
     """
+    from bot.billing import is_pro
     configs = get_enabled_auto_traders()
     if not configs:
         return []
@@ -108,6 +109,11 @@ def maybe_auto_buy(token_address: str, symbol: str, mcap: float,
     results = []
     for cfg in configs:
         try:
+            # Subscription gate: only trial/Pro users auto-trade.
+            # (Sells are NEVER gated — check_all_positions runs for everyone.)
+            if not is_pro(cfg["user_id"]):
+                logger.debug("Auto-buy gated (not Pro): user %s", cfg["user_id"])
+                continue
             trade = _auto_buy_for_config(cfg, token_address, symbol, mcap)
             if trade:
                 results.append(trade)

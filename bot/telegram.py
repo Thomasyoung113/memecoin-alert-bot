@@ -32,7 +32,40 @@ def _get_target_chat_ids() -> list[str]:
     return ids
 
 
-def _send_message(text: str, parse_mode: str = "HTML") -> bool:
+def _post_api(method: str, payload: dict, file_field: str = None,
+              file_bytes: bytes = None, chat_id=None) -> bool:
+    """Single Bot API call with token-redacted error logging."""
+    if not TELEGRAM_BOT_TOKEN:
+        return False
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}"
+    try:
+        if file_field and file_bytes is not None:
+            resp = requests.post(url, files={file_field: ("card.png", file_bytes,
+                                                          "image/png")},
+                                 data=payload, timeout=20)
+        else:
+            resp = requests.post(url, json=payload, timeout=10)
+        resp.raise_for_status()
+        return True
+    except requests.RequestException as e:
+        _safe_log_error(method, chat_id if chat_id is not None else "broadcast", e)
+    return False
+
+
+def send_to_user(telegram_id: int, text: str, parse_mode: str = "HTML",
+                 reply_markup: dict = None) -> bool:
+    """DM one user. The per-user channel for alerts, receipts, reminders."""
+    if not telegram_id:
+        return False
+    payload = {"chat_id": telegram_id, "text": text, "parse_mode": parse_mode,
+               "disable_web_page_preview": False}
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+    return _post_api("sendMessage", payload, chat_id=telegram_id)
+
+
+def _send_message(text: str, parse_mode: str = "HTML",
+                  reply_markup: dict = None) -> bool:
     """Send a plain message to all target chats. Returns True if at least one succeeded."""
     target_ids = _get_target_chat_ids()
     if not TELEGRAM_BOT_TOKEN or not target_ids:
@@ -42,19 +75,16 @@ def _send_message(text: str, parse_mode: str = "HTML") -> bool:
 
     success = False
     for chat_id in target_ids:
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
         payload = {
             "chat_id": chat_id,
             "text": text,
             "parse_mode": parse_mode,
             "disable_web_page_preview": False,
         }
-        try:
-            resp = requests.post(url, json=payload, timeout=10)
-            resp.raise_for_status()
+        if reply_markup:
+            payload["reply_markup"] = reply_markup
+        if _post_api("sendMessage", payload, chat_id=chat_id):
             success = True
-        except requests.RequestException as e:
-            _safe_log_error("sendMessage", chat_id, e)
     return success
 
 
@@ -69,21 +99,10 @@ def _fmt_num(n: float) -> str:
     return f"${n:.2f}"
 
 
-def send_alert(token_address: str, symbol: str, mcap: float,
-               price: float, snapshot: dict, safety: dict | None = None,
-               smart_wallets: list[dict] | None = None):
-    """
-    Send a detailed alert about a promising token.
-
-    Args:
-        token_address: Token mint address
-        symbol: Token symbol
-        mcap: Market cap at alert time
-        price: Price at alert time
-        snapshot: Dict of metrics from the scanner
-        safety: Dict from RugCheck checker
-        smart_wallets: List of known smart wallets that bought early
-    """
+def build_alert_text(token_address: str, symbol: str, mcap: float,
+                     snapshot: dict, safety: dict | None = None,
+                     smart_wallets: list[dict] | None = None) -> str:
+    """The full alert message body (shared by broadcast and per-user fanout)."""
     short_addr = f"{token_address[:6]}...{token_address[-4:]}"
     chart_url = f"https://dexscreener.com/solana/{token_address}"
     target_2x = _fmt_num(mcap * 2)
@@ -139,13 +158,28 @@ def send_alert(token_address: str, symbol: str, mcap: float,
     lines.append(f"")
     lines.append(f"🔗 <a href='{chart_url}'>View on DexScreener</a>")
 
-    text = "\n".join(lines)
+    return "\n".join(lines)
+
+
+def send_alert(token_address: str, symbol: str, mcap: float,
+               price: float, snapshot: dict, safety: dict | None = None,
+               smart_wallets: list[dict] | None = None):
+    """Broadcast the alert to the owner (+channel) AND DM eligible users."""
+    from bot.models import get_telegram_ids_by_tier
+    text = build_alert_text(token_address, symbol, mcap, snapshot, safety,
+                            smart_wallets)
     _send_message(text)
+    # Per-user fanout: trial + paid Pro get every call in real time.
+    # (Free tier only gets the weekly top call — see billing jobs.)
+    for tid in get_telegram_ids_by_tier(["trial", "pro"],
+                                        statuses=("active", "grace")):
+        if tid != TELEGRAM_CHAT_ID:  # owner already got the broadcast
+            send_to_user(tid, text)
 
 
 def send_update(message: str):
     """Send a plain text update (for resolved trades, learning results, etc.)."""
-    _send_message(f"📡 <b>Bot Update</b>\n\n{message}")
+    _send_message(f"📡 <b>Bot Update</b>\n\n{html.escape(message)}")
 
 
 def send_resolved(symbol: str, mcap: float, target_mcap: float,
@@ -197,33 +231,26 @@ def send_resolved(symbol: str, mcap: float, target_mcap: float,
     _send_message("\n".join(lines))
 
 
-def send_photo(photo_bytes: bytes, caption: str = None):
-    """Send a photo to all target chats. Returns True if at least one succeeded."""
-    target_ids = _get_target_chat_ids()
-    if not TELEGRAM_BOT_TOKEN or not target_ids:
+def send_photo(photo_bytes: bytes, caption: str = None,
+               telegram_id: int = None):
+    """Send a photo (with a proper photo caption) to target chats or one user."""
+    if not TELEGRAM_BOT_TOKEN:
+        return False
+    if telegram_id:
+        target_ids = [telegram_id]
+    else:
+        target_ids = _get_target_chat_ids()
+    if not target_ids:
         return False
     success = False
     for chat_id in target_ids:
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
-        try:
-            resp = requests.post(
-                url,
-                files={"photo": ("card.png", photo_bytes, "image/png")},
-                data={"chat_id": chat_id},
-                timeout=20,
-            )
-            if caption:
-                # Send caption as a separate reply
-                requests.post(
-                    f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-                    json={"chat_id": chat_id, "text": caption, "parse_mode": "HTML",
-                           "disable_web_page_preview": False},
-                    timeout=10,
-                )
-            resp.raise_for_status()
+        payload = {"chat_id": chat_id}
+        if caption:
+            payload["caption"] = caption
+            payload["parse_mode"] = "HTML"
+        if _post_api("sendPhoto", payload, file_field="photo",
+                     file_bytes=photo_bytes, chat_id=chat_id):
             success = True
-        except requests.RequestException as e:
-            _safe_log_error("sendPhoto", chat_id, e)
     return success
 
 
@@ -231,7 +258,8 @@ def send_pnl_card(symbol: str, pnl_pct: float, entry_mcap: float,
                    current_mcap: float = None, peak_mcap: float = None,
                    duration: str = None, wallet: str = None,
                    caption_title: str = None, multiplier: float = None,
-                   sol_spent: float = None, sol_received: float = None):
+                   sol_spent: float = None, sol_received: float = None,
+                   telegram_id: int = None):
     """Generate and send a GEMBOT-branded PnL card as a photo."""
     is_win = pnl_pct >= 0
     from bot.pnl_card import generate_pnl_card
@@ -252,13 +280,14 @@ def send_pnl_card(symbol: str, pnl_pct: float, entry_mcap: float,
     status = caption_title or ("✅ HIT 2x!" if is_win else "💀 STOPPED OUT")
     caption = (
         f"<b>{status}</b>\n"
-        f"${symbol} | GEMBOT"
+        f"${html.escape(symbol)} | GEMBOT"
     )
-    send_photo(img_bytes, caption=caption)
+    send_photo(img_bytes, caption=caption, telegram_id=telegram_id)
 
 
 def send_milestone_card(symbol: str, multiplier: float, alert_mcap: float,
-                        current_mcap: float = None, duration: str = None):
+                        current_mcap: float = None, duration: str = None,
+                        telegram_id: int = None):
     """Send a celebration card when a bot call crosses a new multiple (1.5x, 2x, 3x...)."""
     from bot.pnl_card import generate_pnl_card
     pnl_pct = (multiplier - 1) * 100
@@ -277,7 +306,7 @@ def send_milestone_card(symbol: str, multiplier: float, alert_mcap: float,
     caption = (
         f"🚀 <b>${html.escape(symbol)} just hit {multiplier:g}x</b> from a GEMBOT call!"
     )
-    send_photo(img_bytes, caption=caption)
+    send_photo(img_bytes, caption=caption, telegram_id=telegram_id)
 
 
 def send_learning_update(iteration: int, changes: list[dict], new_rate: float):
