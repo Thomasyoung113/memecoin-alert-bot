@@ -166,7 +166,8 @@ function escapeHtml(s) {
 }
 
 // ── Auth ─────────────────────────────────────────────────────────────
-const DASHBOARD_TOKEN = (document.querySelector('meta[name="dashboard-token"]') || {}).content || '';
+// Token comes from the sessionStorage prompt (never embedded in page HTML).
+const DASHBOARD_TOKEN = sessionStorage.getItem('dt') || '';
 
 function apiFetch(path) {
   const headers = {};

@@ -135,9 +135,13 @@ class _DashboardHandler(SimpleHTTPRequestHandler):
             self._send_error_json(str(e))
 
     def _check_auth(self) -> bool:
-        """Return True if the request is authenticated (or auth is disabled)."""
+        """Fail-closed: /api/* requires DASHBOARD_TOKEN to be set AND match.
+
+        Empty token = auth DISABLED by misconfiguration — refuse instead
+        of silently exposing subscriber data to the public internet."""
         if not DASHBOARD_TOKEN:
-            return True
+            logger.error("DASHBOARD_TOKEN unset — refusing /api/* (fail-closed)")
+            return False
         # Check query parameter first, then header
         from urllib.parse import parse_qs, urlparse
         parsed = urlparse(self.path)
@@ -172,11 +176,15 @@ class _DashboardHandler(SimpleHTTPRequestHandler):
             self._send_error_json("index.html not found", 500)
             return
         html = index_path.read_text(encoding="utf-8")
-        # Inject the dashboard token so the frontend JS can use it for API calls
-        if DASHBOARD_TOKEN:
-            # Insert a meta tag with the token right before the closing </head>
-            meta = f'<meta name="dashboard-token" content="{DASHBOARD_TOKEN}">\n'
-            html = html.replace("</head>", f"{meta}</head>")
+        # SECURITY: never embed the API token in served HTML — anyone
+        # fetching / could read it and own every /api endpoint. The page
+        # now prompts the owner for the token (stored per-browser).
+        token_meta = ('<meta name="dashboard-auth" content="required">\n'
+                      '<script>'
+                      'var _dt=prompt("Dashboard token:")||"";'
+                      'sessionStorage.setItem("dt",_dt);'
+                      '</script>\n')
+        html = html.replace("</head>", f"{token_meta}</head>")
         self._send_html(html)
 
 
