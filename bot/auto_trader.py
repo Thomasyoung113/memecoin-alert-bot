@@ -317,8 +317,14 @@ def _execute_sell(pos: dict, reason: str,
         return None
 
     # What does the wallet actually hold? (source of truth on-chain)
+    # get_token_balances returns None on RPC failure — NEVER treat that as
+    # "no balance" or a transient RPC blip would strand/close live positions.
+    balances = get_token_balances(wallet["public_key"])
+    if balances is None:
+        logger.warning("Auto-sell skipped (RPC failure): position %s", pos["id"])
+        return None  # leave position open, retry next cycle
     balance = None
-    for t in get_token_balances(wallet["public_key"]):
+    for t in balances:
         if t["mint"] == pos["token_address"]:
             balance = t
             break
@@ -328,8 +334,21 @@ def _execute_sell(pos: dict, reason: str,
                        "no balance")
         return None
 
-    decimals = balance.get("decimals") or pos.get("token_decimals") or 6
-    amount_raw = int(balance["amount"] * (10 ** decimals))
+    # Decimals: use on-chain value; 0 is a VALID value (never `or` it).
+    # If unknown, ABORT the sell — a wrong guess can strand 99.9% of the
+    # position (6-decimal default on a 9-decimal token).
+    decimals = balance.get("decimals")
+    if decimals is None:
+        decimals = pos.get("token_decimals")
+    if decimals is None:
+        decimals = get_token_decimals(pos["token_address"])
+    if decimals is None:
+        logger.error("Auto-sell aborted: unknown decimals for %s (pos %s)",
+                     pos["token_address"][:8], pos["id"])
+        return None
+    # Raw units from the RPC integer string (exact), fall back to uiAmount.
+    raw_str = balance.get("raw")
+    amount_raw = int(raw_str) if raw_str else int(balance["amount"] * (10 ** decimals))
 
     if current_mcap is None:
         current_mcap = _fetch_current_mcap(pos["token_address"])

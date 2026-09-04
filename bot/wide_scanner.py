@@ -22,7 +22,7 @@ def _load_seen():
     rows = c.fetchall()
     close_cursor(c)
     for r in rows:
-        _seen_tokens.add(r["token_address"])
+        _seen_tokens.add(r[0])
 
 
 def _fetch_token_profile_by_address(token_address: str) -> dict | None:

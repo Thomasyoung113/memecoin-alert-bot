@@ -1,6 +1,6 @@
 """
-Outcome tracker — monitors alerted tokens to see if they hit 2x or -50%.
-Every 60s check evaluates each pending token for both outcomes.
+Outcome tracker — monitors alerted tokens until they hit 2x, -50%, or
+OUTCOME_MAX_HOURS elapses. Checked every OUTCOME_CHECK_INTERVAL seconds.
 """
 import logging
 
@@ -108,28 +108,34 @@ def _update_peak(alert_id: int, peak_mcap: float):
 
 def force_resolve_stale():
     """
-    Mark any pending alerts that have exceeded the max check window as
-    resolved (failed). This prevents unbounded growth.
+    Mark only OLD pending alerts (older than OUTCOME_MAX_HOURS) as
+    resolved (failed). Fresh alerts from a restart must keep tracking —
+    mass-resolving everything at boot polluted the track record with
+    fake misses and abandoned live positions.
 
     Returns number of stale alerts resolved.
     """
-    from bot.models import get_conn
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute(
-        "SELECT id, token_address, symbol, alert_mcap, peak_mcap "
-        "FROM alerts WHERE resolved = 0"
-    )
-    rows = c.fetchall()
-    c.close()
+    from config import OUTCOME_MAX_HOURS
+    from bot.models import execute, close_cursor, _dict_rows
+    from datetime import datetime, timedelta, timezone
+
+    cutoff = (datetime.now(timezone.utc)
+              - timedelta(hours=OUTCOME_MAX_HOURS)).isoformat()
+    c = execute("""
+        SELECT id, token_address, symbol, alert_mcap, peak_mcap
+        FROM alerts WHERE resolved = 0 AND alert_time < %s
+    """, (cutoff,))
+    rows = _dict_rows(c)
+    close_cursor(c)
 
     resolved_count = 0
     for r in rows:
-        peak = r[4] or r[3]  # peak_mcap or alert_mcap
-        mark_resolved(r[1], False, peak)  # token_address
+        peak = r["peak_mcap"] or r["alert_mcap"]
+        mark_resolved(r["token_address"], False, peak)
         resolved_count += 1
 
     if resolved_count:
-        logger.info("Force-resolved %d stale alerts", resolved_count)
+        logger.info("Force-resolved %d stale alerts (>%dh old)",
+                    resolved_count, OUTCOME_MAX_HOURS)
 
     return resolved_count

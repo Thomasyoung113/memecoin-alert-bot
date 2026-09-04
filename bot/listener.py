@@ -67,19 +67,21 @@ def _check_rate_limit(chat_id: str, max_per_minute: int = 5) -> bool:
 
 def _reply(chat_id: int, text: str, parse_mode: str = "HTML",
            reply_markup: dict = None):
-    """Send a reply message to a chat."""
+    """Send a reply message to a chat. Logs failures — never silent."""
     try:
         payload = {
             "chat_id": chat_id,
-            "text": text,
+            "text": text[:4000],  # Telegram hard limit is 4096
             "parse_mode": parse_mode,
             "disable_web_page_preview": False,
         }
         if reply_markup:
             payload["reply_markup"] = reply_markup
-        requests.post(f"{_API}/sendMessage", json=payload, timeout=10)
+        resp = requests.post(f"{_API}/sendMessage", json=payload, timeout=10)
+        if not resp.ok:
+            logger.error("Reply to %s rejected: %s", chat_id, resp.text[:200])
     except requests.RequestException as e:
-        logger.debug("Failed to reply to %s: %s", chat_id, e)
+        logger.error("Failed to reply to %s: %s", chat_id, e)
 
 
 def _short_pubkey(pubkey: str) -> str:
@@ -588,12 +590,12 @@ def _cmd_status(chat_id: int, text: str):
     if result["confirmed"]:
         _reply(chat_id,
             f"✅ <b>Transaction Confirmed</b>\n\n"
-            f"Signature: <code>{sig[:20]}...</code>\n"
+            f"Signature: <code>{html.escape(sig[:20])}...</code>\n"
             f"Slot: {result['slot']}\n\n"
             f"🔗 <a href='https://solscan.io/tx/{sig}'>View on Solscan</a>"
         )
     elif result["error"]:
-        _reply(chat_id, f"❌ Transaction failed: {result['error']}")
+        _reply(chat_id, f"❌ Transaction failed: {html.escape(str(result['error']))[:120]}")
     else:
         _reply(chat_id, "⏳ Transaction still pending...")
 
@@ -656,7 +658,8 @@ def _cmd_auto(chat_id: int, text: str):
         lines.append(f"Open positions: {len(positions)}")
         for p in positions[:5]:
             pnl = p.get("pnl_pct")
-            lines.append(f"  • ${p.get('token_symbol') or p['token_address'][:6]}"
+            sym = html.escape(p.get('token_symbol') or p['token_address'][:6])
+            lines.append(f"  • ${sym}"
                          f" — ◎{p.get('amount_sol_invested') or 0:.4f} in")
         lines.append("")
         lines.append("<b>Commands:</b>")
@@ -745,7 +748,7 @@ def _require_pro(chat_id: int) -> bool:
         return True
     _reply(chat_id,
         "🔒 <b>Pro feature</b>\n\n"
-        f"{subscription_status_line(chat_id) if user else 'Send /start first'}\n\n"
+        f"{subscription_status_line(user['id']) if user else 'Send /start first'}\n\n"
         "💎 <b>0.2 SOL/week · 0.5 SOL/month</b>\n"
         "✅ Every call, real time · 🤖 24/7 auto-trading\n"
         "🎟 Promo codes drop daily on @thomas_young",
@@ -911,8 +914,16 @@ def _handle_callback(cb: dict):
 
     if data.startswith("sub:sol_"):
         plan = data.split("_", 1)[1]
+        uid = get_user_id(chat_id)
+        if not uid:
+            ack("Send /start first.", alert=True)
+            return
         ack("⏳ Generating your deposit address...")
-        inv = billing.create_invoice(get_user_id(chat_id), plan)
+        try:
+            inv = billing.create_invoice(uid, plan)
+        except Exception:
+            logger.exception("Invoice creation failed for user %s", uid)
+            inv = None
         if inv:
             _reply(chat_id,
                 "💳 <b>SOL invoice</b>\n\n"
@@ -920,10 +931,39 @@ def _handle_callback(cb: dict):
                 f"⏱ Expires in {inv['ttl_minutes']} min.\n"
                 "Pro activates automatically after 1 confirmation.",
                 reply_markup=_with_back([
-                    [{"text": "🔄 Check status", "callback_data": f"sub:check_{inv['invoice_id']}_{plan}"}],
+                    [{"text": "🔄 Check status", "callback_data": f"sub:check_{inv['invoice_id']}"}],
                 ], target="sub"))
         else:
             _reply(chat_id, "❌ Could not create invoice. Try again shortly.")
+        return
+
+    if data.startswith("sub:check_"):
+        ack()
+        from bot.models import execute, close_cursor, _dict_rows
+        try:
+            inv_id = int(data.rsplit("_", 1)[1])
+        except ValueError:
+            return
+        c = execute("SELECT status, expected_sol, receive_address, paid_tx_sig "
+                    "FROM deposit_invoices WHERE id = %s AND user_id = %s",
+                    (inv_id, get_user_id(chat_id)))
+        rows = _dict_rows(c)
+        close_cursor(c)
+        if not rows:
+            _reply(chat_id, "❌ Invoice not found.")
+            return
+        inv = rows[0]
+        status = inv["status"]
+        if status == "paid":
+            _reply(chat_id, "✅ <b>Paid!</b> Pro is active — check /auto.")
+        elif status == "awaiting":
+            _reply(chat_id,
+                   "⏳ <b>Awaiting payment</b>\n\n"
+                   f"Send <b>◎ {inv['expected_sol']}</b> to:\n"
+                   f"<code>{inv['receive_address']}</code>\n\n"
+                   "Pro activates automatically after 1 confirmation.")
+        else:
+            _reply(chat_id, "⌛ This invoice expired. Tap 💎 Subscribe for a fresh address.")
         return
 
     if data == "sub:stars_menu":
@@ -958,6 +998,7 @@ def _handle_callback(cb: dict):
 
     if data.startswith("auto:amt_"):
         amount = float(data.rsplit("_", 1)[1])
+        amount = max(0.001, min(10.0, amount))  # same clamp as /auto set
         uid = get_user_id(chat_id)
         if not uid:
             ack("Send /start first.", alert=True)
@@ -978,7 +1019,7 @@ def _handle_callback(cb: dict):
         return
 
     if data.startswith("auto:tp_"):
-        pct = float(data.rsplit("_", 1)[1])
+        pct = max(10.0, min(10000.0, float(data.rsplit("_", 1)[1])))
         uid = get_user_id(chat_id)
         wallet = get_default_wallet(uid) if uid else None
         if not wallet:
@@ -992,7 +1033,7 @@ def _handle_callback(cb: dict):
         return
 
     if data.startswith("auto:sl_"):
-        pct = float(data.rsplit("_", 1)[1])
+        pct = max(1.0, min(99.0, float(data.rsplit("_", 1)[1])))
         uid = get_user_id(chat_id)
         wallet = get_default_wallet(uid) if uid else None
         if not wallet:
@@ -1028,7 +1069,11 @@ def _handle_callback(cb: dict):
         return
 
     if data.startswith("sell:"):
-        _, addr, pct = data.split(":")
+        parts = data.split(":")
+        if len(parts) != 3:
+            ack("Bad request.")
+            return
+        _, addr, pct = parts
         ack("⏳ Selling...")
         _cmd_sell(chat_id, f"/sell {addr} {pct}")
         return
@@ -1161,15 +1206,25 @@ def listen():
 
                 # Rate limit normal commands (payments already handled above)
                 if not _check_rate_limit(chat_id):
+                    _reply(chat_id, "⏳ Slow down — max 5 commands per minute.")
                     continue
 
                 if text.strip().startswith("/"):
-                    _route(chat_id, text.strip())
+                    try:
+                        _route(chat_id, text.strip())
+                    except Exception:
+                        # A handler crash must never kill the listener thread
+                        # (daemon thread death = bot goes deaf until restart).
+                        logger.exception("Command handler crashed: %s", text[:60])
+                        try:
+                            _reply(chat_id, "⚠️ Something went wrong. Try again.")
+                        except Exception:
+                            pass
 
         except requests.Timeout:
             pass
         except requests.RequestException as e:
-            logger.debug("Listener poll error: %s", e)
+            logger.warning("Listener poll error: %s", e)
             time.sleep(5)
 
         time.sleep(_POLL_INTERVAL)

@@ -23,7 +23,7 @@ def _load_seen():
     rows = c.fetchall()
     close_cursor(c)
     for r in rows:
-        _seen_tokens.add(r["token_address"])
+        _seen_tokens.add(r[0])
     logger.debug("Loaded %d previously seen whale tokens", len(_seen_tokens))
 
 

@@ -8,6 +8,10 @@ Telegram /start listener, and wide scanner (Phase 2).
 import time
 import logging
 import sys
+import html as html_escape_mod
+
+def html_escape(s):
+    return html_escape_mod.escape(str(s))
 
 from config import (
     POLL_INTERVAL, OUTCOME_CHECK_INTERVAL, LEARN_INTERVAL,
@@ -27,9 +31,9 @@ from bot.whale_watcher import start_whale_watcher
 from bot.smart_money import get_smart_wallets_for_token, mark_token_success_for_wallets
 from bot.milestones import check_milestones
 from bot.wash_detector import (
-    compute_wash_score, reject_call, wash_line, WASH_SCORE_AUTOBUY_MAX,
+    compute_wash_score, reject_call, wash_line,
 )
-from bot.scanner import _fetch_pair_data as _fetch_pair_for_wash
+from bot.telegram import notify_owner
 from bot.auto_trader import maybe_auto_buy, maybe_auto_sell, check_all_positions
 from bot.billing import start_billing
 from bot.telegram import (
@@ -57,13 +61,21 @@ def _fmt_interval(seconds: int) -> str:
 
 
 def _announce_sell(sell: dict):
-    """Announce an auto-sell in Telegram: text update + PnL card."""
+    """Announce an auto-sell: text + PnL card to the SELLER (per-user),
+    a copy to the owner. Never broadcast user trades to channels."""
+    from bot.telegram import send_to_user
+    sym = html_escape(sell["symbol"])
     pnl = sell.get("pnl_pct") or 0.0
     sign = "+" if pnl >= 0 else ""
-    send_update(f"🤖 Auto-sold ${sell['symbol']}\n"
-                f"Reason: {sell['reason']}\n"
-                f"PnL: {sign}{pnl:.1f}%\n"
-                f"Tx: <code>{sell['tx_sig'][:16]}...</code>")
+    text = (f"🤖 Auto-sold ${sym}\n"
+            f"Reason: {html_escape(sell['reason'])}\n"
+            f"PnL: {sign}{pnl:.1f}%\n"
+            f"Tx: <code>{sell['tx_sig'][:16]}...</code>")
+    from bot.models import get_telegram_id
+    tid = get_telegram_id(sell.get("user_id"))
+    if tid:
+        send_to_user(tid, text)
+    notify_owner(text)
     try:
         send_pnl_card(
             symbol=sell["symbol"],
@@ -72,10 +84,11 @@ def _announce_sell(sell: dict):
             current_mcap=sell.get("current_mcap"),
             peak_mcap=sell.get("current_mcap"),
             duration=sell.get("duration"),
-            caption_title=f"💰 SOLD ${sell['symbol']} — {sign}{pnl:.1f}%",
+            caption_title=f"💰 SOLD ${sym} — {sign}{pnl:.1f}%",
             multiplier=sell.get("multiplier"),
             sol_spent=sell.get("sol_spent"),
             sol_received=sell.get("sol_received"),
+            telegram_id=tid,
         )
     except Exception as e:
         logger.error("Sell PnL card failed for %s: %s", sell["symbol"], e)
@@ -83,8 +96,8 @@ def _announce_sell(sell: dict):
 
 def main():
     print("=" * 50)
-    print("  🚀 ALERT BOT — Memecoin Gem Spotter")
-    print("  Phase 2: Smart Money Detection Active")
+    print("  🚀 GEMBOT — Memecoin Calls + Auto-Trading")
+    print("  Phases 1-4: Wallets · Trading · Automation · Monetization")
     print("=" * 50)
     print()
 
@@ -105,6 +118,14 @@ def main():
     start_whale_watcher()                  # Whale wallet monitor
     start_dashboard()                      # Web dashboard on port 8080
     start_billing()                        # Subs: promos, expiries, invoices
+
+    # Startup preflight: shout about degraded features (gate-channel admin
+    # missing = /start locked for everyone; treasury/Pro-channel unset, etc.)
+    from bot.billing import run_preflight
+    try:
+        run_preflight()
+    except Exception:
+        logger.exception("Preflight failed (non-fatal)")
 
     # ── State ─────────────────────────────────────────────────────
     last_outcome_check = 0
@@ -137,56 +158,72 @@ def main():
             logger.info("Scanning for new tokens...")
             candidates = scan()
 
-            for token_address, symbol, mcap, price, snapshot in candidates:
-                logger.info("Processing candidate: $%s (MCap: $%.0f)",
-                            symbol, mcap)
+            for cand in candidates:
+                token_address, symbol, mcap, price, snapshot, pair = cand
+                try:
+                    logger.info("Processing candidate: $%s (MCap: $%.0f)",
+                                symbol, mcap)
 
-                # Safety check via RugCheck (full report: creator fields
-                # ride along for the wash detector — no extra API call)
-                safe, safety_detail = is_safe(token_address)
-                if not safe:
-                    logger.info("  └─ Unsafe: %s",
-                                safety_detail.get("reason", "unknown"))
+                    # Safety check via RugCheck (full report: creator fields
+                    # ride along for the wash detector — no extra API call)
+                    safe, safety_detail = is_safe(token_address)
+                    if not safe:
+                        logger.info("  └─ Unsafe: %s",
+                                    safety_detail.get("reason", "unknown"))
+                        continue
+
+                    # ── Wash-trading gate (Pump.fun creator-revenue farms) ──
+                    # Owner decision: wash_score >= 35 = NO CALL at all.
+                    # Uses the SAME pair object the filters scored.
+                    wash = compute_wash_score(
+                        pair,
+                        rugcheck_report=safety_detail.get("report"),
+                    )
+                    if reject_call(wash["wash_score"]):
+                        logger.info("  └─ 🧼 Wash-gated %s (score %d: %s)",
+                                    symbol, wash["wash_score"],
+                                    wash_line(wash["wash_score"], wash["detail"]))
+                        continue
+
+                    # Phase 2: Check if any known smart wallets bought early on this token
+                    smart_wallets = get_smart_wallets_for_token(token_address)
+
+                    # Save to DB
+                    target_mcap = mcap * TWO_X_TARGET
+                    save_alert(token_address, symbol, mcap, price,
+                               target_mcap, snapshot,
+                               wash_score=wash["wash_score"],
+                               creator_address=wash["detail"].get("creator"))
+
+                    # Send Telegram alert
+                    send_alert(
+                        token_address, symbol, mcap, price,
+                        snapshot, safety_detail, smart_wallets,
+                        wash_score=wash["wash_score"],
+                        wash_detail=wash["detail"],
+                    )
+                except Exception:
+                    # One bad candidate must never kill the rest of the
+                    # batch (nor the outcome/TP-SL/learning phases below).
+                    logger.exception("Candidate %s failed", token_address[:8])
                     continue
-
-                # ── Wash-trading gate (Pump.fun creator-revenue farms) ──
-                # Owner decision: wash_score >= 35 = NO CALL at all.
-                wash = compute_wash_score(
-                    _fetch_pair_for_wash(token_address),
-                    rugcheck_report=safety_detail.get("report"),
-                )
-                if reject_call(wash["wash_score"]):
-                    logger.info("  └─ 🧼 Wash-gated %s (score %d: %s)",
-                                symbol, wash["wash_score"],
-                                wash_line(wash["wash_score"], wash["detail"]))
-                    continue
-
-                # Phase 2: Check if any known smart wallets bought early on this token
-                smart_wallets = get_smart_wallets_for_token(token_address)
-
-                # Save to DB
-                target_mcap = mcap * TWO_X_TARGET
-                save_alert(token_address, symbol, mcap, price,
-                           target_mcap, snapshot,
-                           wash_score=wash["wash_score"],
-                           creator_address=wash["detail"].get("creator"))
-
-                # Send Telegram alert
-                send_alert(
-                    token_address, symbol, mcap, price,
-                    snapshot, safety_detail, smart_wallets,
-                    wash_score=wash["wash_score"],
-                    wash_detail=wash["detail"],
-                )
 
                 try:
                     auto_trades = maybe_auto_buy(
                         token_address, symbol, mcap, price, snapshot,
                         wash_score=wash["wash_score"])
                     for at in auto_trades:
-                        send_update(f"🤖 Auto-bought ${symbol}\n"
-                                    f"Amount: ◎ {at['amount_sol']:.4f}\n"
-                                    f"Tx: <code>{at['tx_sig'][:16]}...</code>")
+                        # Per-user confirmation (NOT broadcast — trades are
+                        # private), owner gets a copy.
+                        from bot.models import get_telegram_id
+                        from bot.telegram import send_to_user
+                        tid = get_telegram_id(at["user_id"])
+                        txt = (f"🤖 Auto-bought ${html_escape(symbol)}\n"
+                               f"Amount: ◎ {at['amount_sol']:.4f}\n"
+                               f"Tx: <code>{at['tx_sig'][:16]}...</code>")
+                        if tid:
+                            send_to_user(tid, txt)
+                        notify_owner(txt)
                 except Exception as e:
                     logger.error("Auto-buy hook failed for %s: %s", symbol, e)
 
@@ -212,20 +249,24 @@ def main():
                         hit_loss=r.get("hit_loss", False),
                         current_mcap=r.get("current_mcap"),
                     )
-                    # Send PnL card for 2x wins
+                    # Send PnL card for 2x wins — peak-based: the run may
+                    # have dumped since the spike, so the card celebrates
+                    # what the CALL achieved, not the current drawdown.
                     if r["hit_2x"]:
                         alert_mcap = r["alert_mcap"]
                         current_mcap = r.get("current_mcap", alert_mcap * 2)
                         peak_mcap = r.get("peak_mcap", current_mcap)
-                        pnl_pct = ((current_mcap / alert_mcap) - 1) * 100
+                        peak_pnl = ((peak_mcap / alert_mcap) - 1) * 100
                         try:
                             send_pnl_card(
                                 symbol=r["symbol"],
-                                pnl_pct=pnl_pct,
+                                pnl_pct=peak_pnl,
                                 entry_mcap=alert_mcap,
                                 current_mcap=current_mcap,
                                 peak_mcap=peak_mcap,
                                 wallet=None,
+                                caption_title=(
+                                    f"🎯 2x REACHED — peaked {peak_pnl:+.0f}%"),
                             )
                         except Exception as e:
                             logger.error("Failed to generate PnL card for %s: %s",
@@ -235,9 +276,10 @@ def main():
                             _announce_sell(as_)
                     except Exception as e:
                         logger.error("Auto-sell hook failed for %s: %s", r['symbol'], e)
-                    # Phase 2: Update smart wallet stats based on resolution
-                    if r["hit_2x"]:
-                        mark_token_success_for_wallets(r.get("token_address", ""))
+                    # Update smart wallet stats on ALL resolutions (wins AND
+                    # losses — otherwise hit rates drift to meaningless).
+                    mark_token_success_for_wallets(
+                        r.get("token_address", ""), hit_2x=r["hit_2x"])
                 if resolutions:
                     total_alerts, total_success, success_rate = get_stats()
                     logger.info("Track record after resolution: %d/%d — %.1f%%",
@@ -279,7 +321,7 @@ def main():
                     logger.warning("Insider selling detected on %d token(s)",
                                    len(insider_alerts))
 
-                last_outcome_check = now
+                last_outcome_check = time.time()  # fresh: block may run long
 
             # ── 3. LEARN ──────────────────────────────────────────
             if now - last_learn >= LEARN_INTERVAL:
@@ -292,7 +334,7 @@ def main():
                     logger.info("Learning: %d adjustments made", len(changes))
                 else:
                     logger.info("Learning: no adjustments needed")
-                last_learn = now
+                last_learn = time.time()
 
             # ── Sleep ─────────────────────────────────────────────
             time.sleep(POLL_INTERVAL)

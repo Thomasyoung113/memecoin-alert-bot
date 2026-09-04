@@ -100,12 +100,15 @@ def get_sol_balance(pubkey: str) -> float:
     return 0.0
 
 
-def get_token_balances(pubkey: str) -> list[dict]:
+def get_token_balances(pubkey: str):
     """
     Get all SPL token balances for a wallet.
 
     Returns list of dicts:
-      [{"mint": str, "amount": float, "decimals": int, "symbol": str or None}, ...]
+      [{"mint", "amount" (human units), "raw" (raw units string),
+        "decimals"}, ...]
+    Returns None when the RPC call itself fails — DISTINCT from an empty
+    wallet. Callers MUST NOT treat None as "no balance".
     """
     result = _rpc_call("getTokenAccountsByOwner", [
         pubkey,
@@ -114,7 +117,7 @@ def get_token_balances(pubkey: str) -> list[dict]:
     ])
     tokens = []
     if not result or "result" not in result:
-        return tokens
+        return None  # RPC failed — unknown state
     for account in result["result"].get("value", []):
         account_data = account.get("account", {}).get("data", {})
         parsed = account_data.get("parsed", {})
@@ -126,6 +129,7 @@ def get_token_balances(pubkey: str) -> list[dict]:
             tokens.append({
                 "mint": mint,
                 "amount": ui_amount,
+                "raw": token_amount.get("amount", "0"),
                 "decimals": token_amount.get("decimals", 0),
             })
     return tokens

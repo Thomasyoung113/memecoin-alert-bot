@@ -15,8 +15,8 @@ Owns everything subscription-related:
 Funds-safety rule enforced everywhere: sells / TP-SL / wallet management
 are NEVER gated. Only buys (manual + auto) and the alert stream are Pro.
 """
+import html
 import logging
-import secrets
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -33,6 +33,7 @@ from config import (
     PROMO_CODE_LEN, PROMO_GEN_HOUR_UTC, SIGNAL_HOUR_UTC,
     FREE_TOP_CALL_DAYS, PROMO_RATE_LIMIT_PER_DAY,
     TREASURY_WALLET_ADDRESS, INVOICE_TTL_MINUTES,
+    WALLET_ENCRYPTION_KEY,
 )
 
 logger = logging.getLogger(__name__)
@@ -229,21 +230,28 @@ def _sweep_to_treasury(encrypted_privkey: str, min_balance: float = 0.002) -> st
         from solders.system_program import TransferParams, transfer
         from solders.transaction import Transaction
         from solders.pubkey import Pubkey
-        kp = Keypair.from_bytes(decrypt_private_key(encrypted_privkey))
         from bot.wallet import get_sol_balance
+        kp = Keypair.from_bytes(decrypt_private_key(encrypted_privkey))
         balance = get_sol_balance(str(kp.pubkey()))
         if balance <= min_balance:
             return None
         send_lamports = int((balance - min_balance) * LAMPORTS_PER_SOL)
         if send_lamports <= 0:
             return None
+        # Legacy transactions REQUIRE a fresh blockhash — without it every
+        # send fails with "Blockhash not found".
+        from bot.helius import _rpc_call
+        bh = _rpc_call("getLatestBlockhash", [])
+        if not bh or "result" not in bh:
+            logger.warning("Sweep: could not fetch blockhash")
+            return None
+        blockhash = (bh["result"]["value"]["blockhash"])
         ix = transfer(TransferParams(
             from_pubkey=kp.pubkey(),
             to_pubkey=Pubkey.from_string(TREASURY_WALLET_ADDRESS),
             lamports=send_lamports))
-        tx = Transaction.new_signed_with_payer([ix], [kp.pubkey()], [kp],
-                                               kp.pubkey())
-        from bot.helius import _rpc_call
+        tx = Transaction.new_signed_with_blockhash([ix], kp.pubkey(), [kp],
+                                                   blockhash)
         import base64
         result = _rpc_call("sendTransaction", [base64.b64encode(bytes(tx)).decode(),
                                                {"encoding": "base64"}])
@@ -261,9 +269,9 @@ def check_pending_invoices() -> list[dict]:
         get_pending_invoices, mark_invoice_paid, activate_subscription,
         record_payment, expire_stale_invoices, get_telegram_id,
     )
-    from bot.wallet import get_sol_balance, decrypt_private_key
+    from bot.wallet import get_sol_balance
     credited = []
-    # expire stale ones first (users get a fresh invoice on retry)
+    # expire stale ones (30-min grace past TTL so late payments still land)
     for stale in expire_stale_invoices():
         tid = get_telegram_id(stale["user_id"])
         if tid:
@@ -273,33 +281,38 @@ def check_pending_invoices() -> list[dict]:
             })
     for inv in get_pending_invoices():
         try:
-            from solders.pubkey import Pubkey
             addr = inv["receive_address"]
             balance = get_sol_balance(addr)
             expected = float(inv["expected_sol"] or 0)
             if expected <= 0 or balance < expected * MIN_SOL_PRICE_RATIO:
                 continue
+            plan = inv["plan"] or "week"
+            plan_days = 7 if plan == "week" else 30
             if balance < expected:
-                # partial: pro-rata days on the whole balance
-                daily = SUB_PRICE_MONTH_SOL / 30.0
-                days = max(1, int(balance / daily))
-                row = mark_invoice_paid(inv["id"], "partial")
+                # partial: pro-rata at the PLAN's own daily rate, capped at
+                # the plan's full allotment (underpaying never beats paying).
+                daily = expected / plan_days
+                days = min(plan_days, max(1, int(balance / daily)))
+                sig, sender = _find_deposit_tx(addr, expected)
+                row = mark_invoice_paid(inv["id"], sig or "partial")
                 if row:
                     uid, _plan = row
                     activate_subscription(uid, days, source="sol", plan="pro_rata")
-                    pid = record_payment(uid, "sol", balance, plan="pro_rata",
-                                         sol_tx_sig="partial")
-                    credited.append({"telegram_id": get_telegram_id(uid),
-                                     "days": days, "plan": "pro_rata"})
+                    record_payment(uid, "sol", balance, plan="pro_rata",
+                                   sol_tx_sig=sig)
+                    tid = get_telegram_id(uid)
+                    credited.append({"telegram_id": tid, "days": days,
+                                     "plan": "pro_rata"})
                     _sweep_to_treasury(inv["encrypted_privkey"])
                 continue
-            row = mark_invoice_paid(inv["id"], "onchain")
+            sig, sender = _find_deposit_tx(addr, expected)
+            row = mark_invoice_paid(inv["id"], sig or "onchain")
             if not row:
                 continue
             uid, plan = row
-            days = 7 if plan == "week" else 30
+            days = plan_days
             activate_subscription(uid, days, source="sol", plan=plan)
-            record_payment(uid, "sol", balance, plan=plan, sol_tx_sig="onchain")
+            record_payment(uid, "sol", balance, plan=plan, sol_tx_sig=sig)
             tx = _sweep_to_treasury(inv["encrypted_privkey"])
             if tx:
                 logger.info("Swept invoice wallet %s -> treasury (%s)", addr[:8], tx[:12])
@@ -308,6 +321,38 @@ def check_pending_invoices() -> list[dict]:
         except Exception:
             logger.exception("Invoice check failed for %s", inv.get("id"))
     return credited
+
+
+def _find_deposit_tx(address: str, min_sol: float):
+    """Find the latest funding tx on an invoice wallet.
+
+    Returns (signature, sender) or (None, None) — used so payments are
+    recorded with REAL tx signatures + sender addresses (refundability),
+    not placeholder strings."""
+    from bot.helius import _rpc_call
+    sigs = _rpc_call("getSignaturesForAddress", [
+        address, {"limit": 10}])
+    if not sigs or "result" not in sigs:
+        return None, None
+    for s in sigs["result"]:
+        if s.get("err"):
+            continue
+        tx = _rpc_call("getTransaction", [
+            s["signature"], {"encoding": "jsonParsed",
+                             "maxSupportedTransactionVersion": 0}])
+        try:
+            meta = tx["result"]["meta"]
+            if meta.get("err"):
+                continue
+            keys = (tx["result"]["transaction"]["message"]
+                    ["accountKeys"])
+            payer = keys[0]["pubkey"] if isinstance(keys[0], dict) else keys[0]
+            delta = (meta["postBalances"][0] - meta["preBalances"][0])
+            if delta >= min_sol * 1_000_000_000 * 0.9:
+                return s["signature"], payer
+        except (TypeError, KeyError, IndexError):
+            continue
+    return None, None
 
 
 # ── Telegram Stars ────────────────────────────────────────────────────
@@ -335,17 +380,30 @@ def send_stars_invoice(telegram_id: int, plan: str) -> bool:
 
 
 def handle_pre_checkout_query(pq: dict) -> None:
-    """Answer within 10s: validate payload, then approve or reject."""
+    """Answer within 10s: validate payload AND that the buyer is
+    registered, then approve or reject. Money is only taken after ok=True,
+    so anything we can cheaply validate must happen here."""
     pq_id = pq.get("id")
     payload = pq.get("invoice_payload", "")
     ok = payload in (f"pro_{p}" for p in STARS_PLANS)
+    if ok:
+        from bot.models import get_user_id_by_telegram
+        buyer = pq.get("from", {}).get("id")
+        if not buyer or not get_user_id_by_telegram(buyer):
+            ok = False  # unregistered buyer — reject before charging
     if TELEGRAM_BOT_TOKEN:
         _tg("answerPreCheckoutQuery", {"pre_checkout_query_id": pq_id,
                                        "ok": ok})
 
 
 def handle_successful_payment(telegram_id: int, msg: dict) -> None:
-    """Grant Pro + receipt + Pro-channel invite. Idempotent on charge id."""
+    """Grant Pro + receipt + Pro-channel invite.
+
+    Ordering: ACTIVATE FIRST, then record — if the process dies between
+    the two, the user has Pro but the payment row is missing (annoying,
+    fixable) instead of having paid with nothing granted (unfixable).
+    Genuinely idempotent: record_payment dedupes on charge id, and if it
+    returns an existing id we skip re-activation (Telegram redelivery)."""
     from bot.models import activate_subscription, record_payment, get_user_id_by_telegram
     sp = msg.get("successful_payment", {})
     charge_id = sp.get("telegram_payment_charge_id")
@@ -354,15 +412,85 @@ def handle_successful_payment(telegram_id: int, msg: dict) -> None:
     plan_info = STARS_PLANS.get(plan, STARS_PLANS["week"])
     uid = get_user_id_by_telegram(telegram_id)
     if not uid:
+        logger.error("Stars payment from unregistered user %s — refunded via "
+                     "Telegram? Grant manually after /start.", telegram_id)
+        send_to_owner(f"⚠️ Stars payment from unknown user {telegram_id} "
+                      f"(charge {charge_id}). They must /start, then contact you.")
         return
-    record_payment(uid, "stars", plan_info["stars"], currency="XTR", plan=plan,
-                   provider_charge_id=charge_id)
+    pid = record_payment(uid, "stars", plan_info["stars"], currency="XTR",
+                         plan=plan, provider_charge_id=charge_id)
+    if pid is None:
+        return  # duplicate charge id — already granted
     activate_subscription(uid, plan_info["days"], source="stars", plan=plan)
-    _tg("sendMessage", {"chat_id": telegram_id, "parse_mode": "HTML", "text":
+    ok = _tg("sendMessage", {"chat_id": telegram_id, "parse_mode": "HTML", "text":
         f"💎 <b>Pro activated — {plan_info['days']} days!</b>\n\n"
         "⚡ Every call, real time\n🤖 Auto-trading 24/7\n"
         "Use /auto on to arm the bot."})
+    if not ok:
+        send_to_owner(f"⚠️ Pro activated for user {uid} but the receipt DM "
+                      "failed — they may not know.")
     _send_pro_channel_invite(telegram_id, uid)
+
+
+def send_to_owner(text: str) -> None:
+    """DM the owner (TELEGRAM_CHAT_ID) — for money-path alerts."""
+    if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+        _tg("sendMessage", {"chat_id": TELEGRAM_CHAT_ID, "text": text,
+                            "parse_mode": "HTML"})
+
+
+def run_preflight():
+    """Startup checks that SHOUT about degraded features.
+
+    Without this, silent breakages kill the funnel:
+    - bot not admin of the gate channel -> EVERY /start is locked out
+    - PRO_CHANNEL_ID unset -> paid users never get their invite
+    - TREASURY_WALLET_ADDRESS unset -> SOL accumulates in invoice wallets
+    """
+    problems, warnings = [], []
+    if not TELEGRAM_BOT_TOKEN:
+        problems.append("TELEGRAM_BOT_TOKEN unset — Telegram is dead")
+        return problems, warnings
+
+    me = _tg("getMe")
+    if not me:
+        problems.append("getMe failed — token invalid or API unreachable")
+        return problems, warnings
+
+    # Gate channel: bot must be able to see members
+    member = _tg("getChatMember", {"chat_id": GATE_CHANNEL_ID,
+                                   "user_id": me["id"]})
+    if not member or member.get("status") not in ("administrator", "creator"):
+        problems.append(
+            f"Bot is NOT admin of gate channel {GATE_CHANNEL_ID} — "
+            "/start is LOCKED for everyone. Add the bot as admin there.")
+    # Pro channel: invites require admin too
+    if PRO_CHANNEL_ID:
+        pmember = _tg("getChatMember", {"chat_id": PRO_CHANNEL_ID,
+                                        "user_id": me["id"]})
+        if not pmember or pmember.get("status") not in ("administrator", "creator"):
+            problems.append(
+                f"Bot is NOT admin of PRO_CHANNEL_ID {PRO_CHANNEL_ID} — "
+                "paid users will not receive channel invites.")
+    else:
+        warnings.append("PRO_CHANNEL_ID unset — no official Pro channel")
+    if not TREASURY_WALLET_ADDRESS:
+        warnings.append("TREASURY_WALLET_ADDRESS unset — SOL from paid "
+                        "invoices will pile up in invoice wallets")
+    if not WALLET_ENCRYPTION_KEY:
+        warnings.append("WALLET_ENCRYPTION_KEY unset — wallet creation disabled")
+
+    for p in problems:
+        logger.critical("PREFLIGHT: %s", p)
+    for w in warnings:
+        logger.warning("PREFLIGHT: %s", w)
+    if TELEGRAM_CHAT_ID:
+        msg = "🚦 <b>Startup preflight</b>\n" + "\n".join(
+            [f"❌ {p}" for p in problems] + [f"⚠️ {w}" for w in warnings])
+        if problems or warnings:
+            _tg("sendMessage", {"chat_id": TELEGRAM_CHAT_ID, "text": msg,
+                                "parse_mode": "HTML"})
+    return problems, warnings
 
 
 def _send_pro_channel_invite(telegram_id: int, user_id: int) -> None:
@@ -402,11 +530,13 @@ def _daily_reminder_and_top_call():
     today = now.date().isoformat()
     if kv_get("last_free_reminder") == today:
         return
-    kv_set("last_free_reminder", today)
 
-    free_ids = get_telegram_ids_by_tier(["free"], statuses=("active", "grace"))
+    # Free tier = users whose subscription expired (tier free, status
+    # expired — set together by the expiry transitions). NOT 'active'.
+    free_ids = get_telegram_ids_by_tier(["free"], statuses=("expired",))
     if not free_ids:
         return
+    kv_set("last_free_reminder", today)  # set AFTER audience is known
 
     # weekly pick: best resolved 2x call in the trailing week
     top = None
@@ -433,7 +563,8 @@ def _daily_reminder_and_top_call():
                 "/subscribe to go Pro")
         if top:
             mult = (top.get("peak_mcap") or 0) / max(1, top.get("alert_mcap") or 1)
-            text = (f"🎯 <b>THIS WEEK'S TOP CALL: ${top['symbol']}</b>\n"
+            sym = html.escape(str(top["symbol"]))
+            text = (f"🎯 <b>THIS WEEK'S TOP CALL: ${sym}</b>\n"
                     f"Called at ${top['alert_mcap']:,.0f} → peaked "
                     f"${top.get('peak_mcap') or 0:,.0f} ({mult:.1f}x)\n\n" + text)
             text = text.replace("/subscribe to go Pro",
@@ -453,10 +584,11 @@ def _expiry_jobs():
         execute, close_cursor, commit,
     )
     now = datetime.now(timezone.utc)
-    # warn subs expiring within 48h that haven't been warned
+    # warn subs expiring within 48h that haven't been warned (pro only —
+    # trials get their own expiry notice via get_untouched_trial_expiry)
     c = execute("""
         SELECT id, user_id, expires_at FROM subscriptions
-        WHERE status = 'active' AND warned_48h = FALSE
+        WHERE status = 'active' AND warned_48h = FALSE AND tier = 'pro'
           AND expires_at IS NOT NULL
           AND expires_at < %s AND expires_at > %s
     """, ((now + timedelta(hours=48)).isoformat(), now.isoformat()))
@@ -514,25 +646,54 @@ def _sweep_pro_channel():
 
 
 def _process_invoices():
-    check_pending_invoices()
+    """Credit paid invoices AND notify the payers (SOL path was silent)."""
+    for credit in check_pending_invoices():
+        tid = credit.get("telegram_id")
+        days = credit.get("days", 0)
+        plan = credit.get("plan", "week")
+        if tid:
+            _tg("sendMessage", {"chat_id": tid, "parse_mode": "HTML", "text":
+                f"💎 <b>Payment received — Pro for {days} days!</b>\n\n"
+                "⚡ Every call, real time\n🤖 Auto-trading 24/7\n"
+                "Use /auto on to arm the bot."})
+            from bot.models import get_user_id_by_telegram
+            uid = get_user_id_by_telegram(tid)
+            if uid:
+                _send_pro_channel_invite(tid, uid)
+        send_to_owner(f"💰 SOL invoice credited: {days}d {plan} for "
+                      f"{tid or 'unknown user'}")
 
 
 def billing_loop():
-    """Daemon: runs the daily/weekly/nightly jobs. Safe to loop forever."""
+    """Daemon: runs the daily/weekly/nightly jobs. Safe to loop forever.
+
+    Daily jobs are date-anchored (kv flags): they run once per UTC day,
+    any time AFTER their scheduled hour — a restart or slow tick can
+    delay them but never skip them."""
     while True:
         try:
             now = datetime.now(timezone.utc)
-            if now.hour == PROMO_GEN_HOUR_UTC and now.minute < 10:
-                generate_daily_promos()
-            if now.hour == SIGNAL_HOUR_UTC and now.minute < 10:
-                _daily_reminder_and_top_call()
+            if now.hour >= PROMO_GEN_HOUR_UTC:
+                generate_daily_promos()  # self-guards via last_promo_gen
+            if now.hour >= SIGNAL_HOUR_UTC:
+                _daily_reminder_and_top_call()  # kv last_free_reminder
             _expiry_jobs()
             _process_invoices()
-            if now.hour == 4 and now.minute < 10:  # quiet-hours cleanup
-                _sweep_pro_channel()
+            if now.hour >= 4:  # quiet-hours cleanup
+                _sweep_pro_channel_marked()
         except Exception:
             logger.exception("Billing loop error")
         time.sleep(300)
+
+
+def _sweep_pro_channel_marked():
+    """_sweep_pro_channel with a date anchor so it runs once per day."""
+    from bot.models import kv_get, kv_set
+    today = datetime.now(timezone.utc).date().isoformat()
+    if kv_get("last_pro_sweep") == today:
+        return
+    _sweep_pro_channel()
+    kv_set("last_pro_sweep", today)
 
 
 def start_billing():

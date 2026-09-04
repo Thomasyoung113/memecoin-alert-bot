@@ -194,6 +194,31 @@ def send_update(message: str):
     _send_message(f"📡 <b>Bot Update</b>\n\n{html.escape(message)}")
 
 
+def notify_owner(text: str):
+    """DM the owner only (TELEGRAM_CHAT_ID) — per-user trade confirmations
+    and money-path alerts must not leak to a public channel."""
+    if TELEGRAM_CHAT_ID:
+        try:
+            _post_api("sendMessage", {"chat_id": int(TELEGRAM_CHAT_ID),
+                                      "text": text, "parse_mode": "HTML"},
+                      chat_id=TELEGRAM_CHAT_ID)
+        except (ValueError, TypeError):
+            _post_api("sendMessage", {"chat_id": TELEGRAM_CHAT_ID,
+                                      "text": text, "parse_mode": "HTML"},
+                      chat_id=TELEGRAM_CHAT_ID)
+
+
+def send_pro_update(message: str):
+    """Pro-only feature alerts (whale movements, insider selling)."""
+    from bot.models import get_telegram_ids_by_tier
+    text = f"🐋 <b>Pro Alert</b>\n\n{html.escape(message)}"
+    _send_message(text)  # owner + channel
+    for tid in get_telegram_ids_by_tier(["pro", "trial"],
+                                        statuses=("active", "grace")):
+        if str(tid) != str(TELEGRAM_CHAT_ID):
+            send_to_user(tid, text)
+
+
 def send_resolved(symbol: str, mcap: float, target_mcap: float,
                   hit_2x: bool, peak_mcap: float | None,
                   hit_loss: bool = False, current_mcap: float | None = None):

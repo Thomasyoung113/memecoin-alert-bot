@@ -148,11 +148,11 @@ def _check_filters(pair: dict) -> tuple[bool, dict]:
     return True, snapshot
 
 
-def scan() -> list[tuple[str, str, float, float, dict]]:
+def scan() -> list[tuple]:
     """
     Scan DexScreener for new Solana tokens that pass the filter pipeline.
 
-    Returns: list of (token_address, symbol, mcap, price, snapshot)
+    Returns: list of (token_address, symbol, mcap, price, snapshot, pair)
     """
     if not _seen_tokens:
         _load_seen_tokens()
@@ -195,7 +195,9 @@ def scan() -> list[tuple[str, str, float, float, dict]]:
         mcap = snapshot["mcap"]
         price = float(pair.get("priceUsd") or 0)
 
-        results.append((token_address, symbol, mcap, price, snapshot))
+        # 6th element: the pair itself — wash detector scores the SAME
+        # snapshot the filters used (no second DexScreener fetch).
+        results.append((token_address, symbol, mcap, price, snapshot, pair))
 
         # Small delay to avoid hammering the API
         time.sleep(0.1)

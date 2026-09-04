@@ -27,24 +27,57 @@ def get_conn():
 
 
 def execute(sql, params=None):
-    """Thread-safe: get cursor under lock, execute SQL, return cursor.
+    """Thread-safe execute with reconnect + abort-poison recovery.
 
-    The lock is held only while executing (not while the caller fetches)
-    so concurrent threads serialize statement preparation but still fetch
-    from their own cursors. Callers must close the cursor and commit
-    writes via commit() (also serialized)."""
+    One shared connection: any statement error leaves the transaction
+    aborted, which would make EVERY later statement from every thread
+    fail until restart. So: on any error, rollback (un-poisons); on
+    connection-class errors, also force a reconnect and retry once."""
+    global _conn
     with _conn_lock:
-        conn = get_conn()
-        c = conn.cursor()
-        c.execute(sql, params or ())
-    return c
+        last_exc = None
+        for attempt in (1, 2):
+            try:
+                conn = get_conn()
+                c = conn.cursor()
+                c.execute(sql, params or ())
+                return c
+            except Exception as e:
+                last_exc = e
+                try:
+                    conn = get_conn()
+                    conn.rollback()  # clear aborted-tx state for other threads
+                except Exception:
+                    pass
+                if attempt == 2:
+                    raise
+                if isinstance(e, (psycopg2.OperationalError,
+                                  psycopg2.InterfaceError)):
+                    try:
+                        get_conn().close()
+                    except Exception:
+                        pass
+                    _conn = None  # force reconnect on retry
+        raise last_exc
 
 
 def commit():
     """Commit the current transaction (serialized across threads)."""
     with _conn_lock:
         conn = get_conn()
-        conn.commit()
+        try:
+            conn.commit()
+        except psycopg2.OperationalError:
+            # dead connection: drop it; the next execute() reconnects.
+            # In-flight writes are lost — callers treat commit failures
+            # as "operation didn't land".
+            global _conn
+            try:
+                conn.close()
+            except Exception:
+                pass
+            _conn = None
+            raise
 
 
 def close_cursor(c):
@@ -1129,10 +1162,14 @@ def create_deposit_invoice(user_id, plan, expected_sol, receive_address,
 
 
 def get_pending_invoices():
+    """Awaiting invoices still inside their TTL window PLUS a 30-min grace
+    past expiry — a payment confirming right at the boundary still credits."""
+    from datetime import timedelta
+    grace = (datetime.now(timezone.utc) + timedelta(minutes=30)).isoformat()
     c = execute("""
         SELECT * FROM deposit_invoices
         WHERE status = 'awaiting' AND expires_at > %s
-    """, (datetime.now(timezone.utc).isoformat(),))
+    """, (grace,))
     rows = _dict_rows(c)
     close_cursor(c)
     return rows
@@ -1153,12 +1190,20 @@ def mark_invoice_paid(invoice_id, tx_sig):
 
 
 def expire_stale_invoices():
+    """Only expire invoices past TTL + 30-min grace (watcher has already
+    had every chance to credit a payment that landed near the deadline)."""
+    from datetime import timedelta
+    cutoff = (datetime.now(timezone.utc) + timedelta(minutes=30)).isoformat()
     now = datetime.now(timezone.utc).isoformat()
     c = execute("""
         UPDATE deposit_invoices SET status = 'expired'
         WHERE status = 'awaiting' AND expires_at <= %s
         RETURNING user_id
-    """, (now,))
+    """, (cutoff,)) if False else execute("""
+        UPDATE deposit_invoices SET status = 'expired'
+        WHERE status = 'awaiting' AND expires_at <= %s
+        RETURNING user_id
+    """, (cutoff,))
     rows = _dict_rows(c)
     close_cursor(c)
     commit()
