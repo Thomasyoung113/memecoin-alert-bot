@@ -20,6 +20,5 @@ data/tg_offset.txt
 bot_profile.png
 # Card test output
 test_output/
-validate.py
 audit_findings_all.txt
 run_validation.sh
